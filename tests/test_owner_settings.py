@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.bot.settings import (approval_messages, mask_card_number,
@@ -9,6 +10,7 @@ from app.bot.settings import (approval_messages, mask_card_number,
                               owner_access, parse_service_ids)
 from app.config import Settings
 from app.database.models import Base, Order, OrderStatus, Product, Reseller
+from app.rebecca.models import Admin
 from app.database.settings import RuntimeSettingsService
 from app.notifications.service import NotificationService
 from app.scheduler.jobs import LifecycleRunner
@@ -76,3 +78,40 @@ async def test_manual_reconciliation_in_dry_run_never_mutates_rebecca():
     runner = LifecycleRunner(factory,fake,NotificationService(None,()),Settings(dry_run=True))
     await runner.reconcile_paid_orders()
     assert fake.mutations == []
+
+
+@pytest.mark.asyncio
+async def test_live_reconciliation_verifies_before_credentials_and_recovers_delivery():
+    factory = await sessions()
+    async with factory() as session, session.begin():
+        product = Product(name="Pro",slug="pro",service_type="PROMAX",service_ids=[7],duration_days=30,traffic_gb=10,price_toman=Decimal("100"),users_limit=5)
+        reseller = Reseller(telegram_id=20,status="PROVISIONING")
+        session.add_all([product,reseller]); await session.flush()
+        session.add(Order(order_number="R-LIVE",reseller_id=reseller.id,product_id=product.id,amount=Decimal("100"),currency="IRT",status=OrderStatus.PAID,payment_method="CARD"))
+
+    class ProvisioningFake(FakeRebecca):
+        async def create_reseller_admin(self, payload):
+            self.mutations.append(("create", payload["username"]))
+            self.admins[payload["username"]] = Admin(username=payload["username"],role="reseller",status="active",expire=payload["expire"],data_limit=payload["data_limit"],services=payload["services"],users_limit=payload["users_limit"])
+            return self.admins[payload["username"]]
+
+    class Delivery:
+        def __init__(self): self.attempts=0; self.messages=[]
+        async def send(self, chat_id, text):
+            self.attempts += 1; self.messages.append(text); return self.attempts > 1
+        async def owners(self, text): pass
+
+    fake=ProvisioningFake(); delivery=Delivery()
+    runner=LifecycleRunner(factory,fake,delivery,Settings(dry_run=True))
+    async with factory() as session, session.begin():
+        await runner.runtime.set_operations_mode(session,"live")
+    await runner.reconcile_paid_orders()
+    assert len([x for x in fake.mutations if x[0]=="create"]) == 1
+    await runner.reconcile_paid_orders()
+    assert len([x for x in fake.mutations if x[0]=="create"]) == 1
+    assert any(x[0]=="update" for x in fake.mutations)
+    async with factory() as session:
+        order=await session.scalar(select(Order).where(Order.order_number=="R-LIVE"))
+        reseller=await session.get(Reseller,order.reseller_id)
+        assert order.status==OrderStatus.APPLIED and reseller.status=="ACTIVE"
+    assert delivery.attempts == 2
