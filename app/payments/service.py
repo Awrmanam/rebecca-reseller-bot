@@ -8,7 +8,7 @@ from typing import Any
 from app.database.models import OrderStatus, ResellerStatus
 from app.rebecca.client import RebeccaClient
 from app.rebecca.exceptions import VerificationError
-from app.rebecca.models import Admin
+from app.rebecca.models import Admin, normalize_status
 from app.reseller.quota import renewal_data_limit, renewal_expiry
 
 _locks: dict[int, asyncio.Lock] = {}
@@ -35,7 +35,7 @@ def entitlement_snapshot(admin: Admin) -> dict[str, Any]:
         "services": sorted(str(item) for item in admin.services),
         "users_limit": admin.users_limit,
         "role": admin.role,
-        "status": admin.status.lower(),
+        "status": normalize_status(admin.status),
     }
 
 
@@ -56,7 +56,7 @@ def _matches(live: Admin, snapshot: dict[str, Any]) -> bool:
     actual = entitlement_snapshot(live)
     expected = dict(snapshot)
     expected["services"] = sorted(str(item) for item in snapshot.get("services", []))
-    expected["status"] = str(snapshot.get("status", "")).lower()
+    expected["status"] = normalize_status(str(snapshot.get("status", "")))
     return actual == expected
 
 

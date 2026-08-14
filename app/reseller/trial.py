@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import TrialRecord
+from app.database.models import AuditLog
 from app.rebecca.exceptions import VerificationError
 
 
@@ -31,3 +32,17 @@ async def reserve_trial(
 def failure_status(error: Exception) -> str:
     """Only unsafe/invalid live state consumes a trial terminally."""
     return "FAILED" if isinstance(error, VerificationError) else "PROVISIONING"
+
+
+async def record_dry_run_request(session: AsyncSession, telegram_id: int) -> None:
+    session.add(
+        AuditLog(
+            actor=str(telegram_id),
+            actor_type="TELEGRAM_USER",
+            action="WOULD_PROVISION_TRIAL",
+            target_type="trial",
+            target_identifier=str(telegram_id),
+            result="DRY_RUN",
+        )
+    )
+    await session.flush()

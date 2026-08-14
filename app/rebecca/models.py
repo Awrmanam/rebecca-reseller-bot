@@ -6,6 +6,15 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
+def normalize_status(value: str) -> str:
+    normalized = value.lower().strip()
+    if normalized in {"active", "enabled"}:
+        return "active"
+    if normalized in {"disabled", "inactive"}:
+        return "disabled"
+    return normalized
+
+
 def parse_expire(value: Any) -> datetime | None:
     """Normalize Rebecca's Unix timestamp (or an already parsed ISO value)."""
     if value in (None, 0, "", "0"):

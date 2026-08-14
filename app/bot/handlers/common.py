@@ -22,7 +22,7 @@ from app.payments.plisio import PlisioClient
 from app.rebecca.client import RebeccaClient
 from app.rebecca.exceptions import VerificationError
 from app.reseller.service import credentials, provision
-from app.reseller.trial import failure_status, reserve_trial
+from app.reseller.trial import failure_status, record_dry_run_request, reserve_trial
 
 
 class ReceiptState(StatesGroup):
@@ -214,6 +214,13 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 buttons.append([InlineKeyboardButton(text="✅ عضو شدم", callback_data="membership:trial")])
                 await message.answer("برای استفاده از خدمات ابتدا عضو کانال شوید.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); return
             if enabled is False: await message.answer("تست رایگان غیرفعال است."); return
+            if settings.dry_run:
+                await record_dry_run_request(session, user_id)
+                await session.commit()
+                for owner in settings.owner_ids:
+                    await bot.send_message(owner, f"🧪 WOULD_PROVISION_TRIAL برای Telegram ID {user_id}")
+                await message.answer("🧪 درخواست تست بررسی شد؛ در حالت DRY_RUN هیچ حسابی ساخته و سهمیه تست مصرف نشد.")
+                return
             record=await session.scalar(select(TrialRecord).where(TrialRecord.telegram_id == user_id))
             if record is None:
                 username, _ = credentials()

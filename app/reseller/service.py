@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from app.rebecca.client import RebeccaClient
-from app.rebecca.exceptions import CapabilityMissing, VerificationError
+from app.rebecca.exceptions import VerificationError
 from app.rebecca.models import Admin, parse_expire
 
 RESTRICTED_PERMISSIONS = {
@@ -101,7 +101,6 @@ async def provision(
         "require_2fa": False,
     }
     live = await client.get_admin(username)
-    recovered = live is not None
     if live is None:
         await client.create_reseller_admin(payload)
     else:
@@ -114,13 +113,10 @@ async def provision(
         # A password generated before a crash was never stored. Recovery uses
         # the verified admin update operation to issue a new one, rather than
         # creating another admin or storing plaintext credentials.
-        try:
-            recovery_payload = {key: value for key, value in payload.items() if key != "username"}
-            await client.update_admin(username, recovery_payload)
-        except CapabilityMissing:
-            if recovered:
-                raise VerificationError("password recovery capability unavailable")
-            raise
+        recovery_payload = {key: value for key, value in payload.items() if key != "username"}
+        # CapabilityMissing remains retryable. It must not be converted into a
+        # terminal VerificationError that consumes a trial.
+        await client.update_admin(username, recovery_payload)
     live = await client.get_admin(username)
     try:
         return verify_entitlement(
