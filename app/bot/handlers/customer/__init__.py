@@ -1,0 +1,2 @@
+"""Customer panel presentation components."""
+

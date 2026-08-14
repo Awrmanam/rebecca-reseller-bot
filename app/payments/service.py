@@ -134,6 +134,8 @@ async def apply_order(
 
         if reseller.status in {ResellerStatus.EXPIRED, ResellerStatus.DISABLED}:
             reseller.status = ResellerStatus.ACTIVE
+        if hasattr(product, "id"):
+            reseller.product_id = product.id
         order.status = OrderStatus.APPLIED
         order.applied_at = now
         order.apply_error = None

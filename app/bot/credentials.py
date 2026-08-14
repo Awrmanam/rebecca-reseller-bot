@@ -12,16 +12,17 @@ def credential_message(
     panel_url: str | None,
 ) -> str:
     """Format the one-time credential message; callers must never persist it."""
-    panel = escape(panel_url) if panel_url else "تنظیم نشده"
+    panel = escape(panel_url.strip()) if panel_url else None
     return (
-        "✅ نمایندگی شما فعال شد\n\n"
-        f"📦 پلن: {escape(product_name)}\n"
-        f"📊 حجم: {traffic_gb} GB\n"
-        f"📅 اعتبار: {duration_days} روز / {escape(str(expiry))}\n"
-        f"👥 سقف کاربران: {users_limit if users_limit is not None else 'نامحدود'}\n\n"
-        f"👤 نام کاربری:\n<code>{escape(username)}</code>\n\n"
-        f"🔑 رمز عبور:\n<code>{escape(password)}</code>\n\n"
-        f"🔗 ورود به پنل:\n{panel}"
+        "✅ نمایندگی فعال شد\n\n"
+        f"📦 پلن\n{escape(product_name)}\n\n"
+        f"📊 حجم\n{traffic_gb:,} GB\n\n"
+        f"📅 اعتبار\n{duration_days} روز\n\n"
+        f"👥 سقف کاربران\n{users_limit if users_limit is not None else 'نامحدود'}\n\n"
+        "────────────\n\n"
+        f"👤 نام کاربری\n<code>{escape(username)}</code>\n\n"
+        f"🔑 رمز عبور\n<code>{escape(password)}</code>"
+        + (f"\n\n🔗 ورود به پنل\n{panel}" if panel else "")
     )
 
 
