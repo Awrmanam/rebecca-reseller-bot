@@ -15,8 +15,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.keyboards.main import customer_menu, owner_menu
 from app.bot.middlewares.membership import is_member
-from app.bot.settings import (approval_messages, mask_card_number, normalize_card_number,
+from app.bot.settings import (mask_card_number, normalize_card_number,
                               normalize_support_username, parse_service_ids)
+from app.bot.settings import send_approval_notifications
 from app.config import Settings
 from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
                                  RequiredChannel, Reseller, Setting, TrialRecord)
@@ -191,11 +192,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             reseller = await session.get(Reseller, order.reseller_id)
             dry_run = await runtime.is_dry_run(session)
         if changed:
-            customer_text, owner_text = approval_messages(order.order_number, dry_run)
-            await bot.send_message(reseller.telegram_id, customer_text)
-            if owner_text:
-                for owner in settings.owner_ids:
-                    await bot.send_message(owner, owner_text)
+            await send_approval_notifications(
+                bot, customer_id=reseller.telegram_id, owner_ids=settings.owner_ids,
+                order_number=order.order_number, dry_run=dry_run,
+            )
             if not dry_run and lifecycle is not None:
                 schedule_reconciliation(lifecycle)
         await call.answer("تأیید شد" if changed else "قبلاً پردازش شده", show_alert=True)

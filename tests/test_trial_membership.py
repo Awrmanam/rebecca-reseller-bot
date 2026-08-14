@@ -21,6 +21,7 @@ async def test_trial_only_once_database_enforced():
  async with sf() as s:
   record = await reserve_trial(s,123,"reserved-name"); assert record.admin_username == "reserved-name"; await s.commit()
  async with sf() as s: assert await reserve_trial(s,123,"different-name") is None
+ await e.dispose()
 
 
 def test_transport_failure_keeps_trial_recoverable():

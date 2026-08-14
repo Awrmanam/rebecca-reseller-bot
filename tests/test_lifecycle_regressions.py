@@ -44,6 +44,7 @@ async def test_repeated_expired_sync_does_not_disable_or_notify_again():
         await runner._sync_resellers(session)
     assert not [item for item in fake.mutations if item[0] == "disable_admin"]
     assert notices.messages == []
+    await sessions.kw["bind"].dispose()
 
 
 @pytest.mark.asyncio
@@ -64,3 +65,4 @@ async def test_renewed_own_expiry_user_is_enabled_and_warning_reset():
         assert cached.delete_after is None and cached.warning_sent_at is None
         assert not cached.disabled_by_own_expiry and cached.local_status=="ACTIVE"
     assert any(item[0]=="update_user" for item in fake.mutations)
+    await sessions.kw["bind"].dispose()

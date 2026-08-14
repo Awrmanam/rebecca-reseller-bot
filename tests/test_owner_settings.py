@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.bot.settings import (approval_messages, mask_card_number,
                               normalize_card_number, normalize_support_username,
                               owner_access, parse_service_ids)
+from app.bot.settings import send_approval_notifications
 from app.config import Settings
 from app.database.models import Base, Order, OrderStatus, Product, Reseller
 from app.rebecca.models import Admin
@@ -43,6 +44,23 @@ def test_approval_messages_are_explicit_for_each_mode():
     assert "صف پردازش" in live_customer and live_owner is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run, expected_count", [(False, 1), (True, 3)])
+async def test_all_card_approval_paths_share_customer_and_owner_notifications(
+    dry_run, expected_count
+):
+    class Bot:
+        def __init__(self): self.messages=[]
+        async def send_message(self, chat_id, text): self.messages.append((chat_id,text))
+    bot=Bot()
+    await send_approval_notifications(
+        bot, customer_id=99, owner_ids=(1,2), order_number="R1", dry_run=dry_run
+    )
+    assert len(bot.messages)==expected_count
+    assert bot.messages[0][0]==99 and "تأیید شد" in bot.messages[0][1]
+    if dry_run: assert "حالت آزمایشی" in bot.messages[0][1]
+
+
 async def sessions():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -64,6 +82,7 @@ async def test_operations_mode_defaults_to_env_and_live_requires_explicit_set():
         assert await runtime.operations_mode(session) == "dry_run"
     assert "allow_delete_actions" not in runtime.EDITABLE
     assert "destructive_actions" not in runtime.EDITABLE
+    await factory.kw["bind"].dispose()
 
 
 @pytest.mark.asyncio
@@ -78,6 +97,7 @@ async def test_manual_reconciliation_in_dry_run_never_mutates_rebecca():
     runner = LifecycleRunner(factory,fake,NotificationService(None,()),Settings(dry_run=True))
     await runner.reconcile_paid_orders()
     assert fake.mutations == []
+    await factory.kw["bind"].dispose()
 
 
 @pytest.mark.asyncio
@@ -115,3 +135,4 @@ async def test_live_reconciliation_verifies_before_credentials_and_recovers_deli
         reseller=await session.get(Reseller,order.reseller_id)
         assert order.status==OrderStatus.APPLIED and reseller.status=="ACTIVE"
     assert delivery.attempts == 2
+    await factory.kw["bind"].dispose()

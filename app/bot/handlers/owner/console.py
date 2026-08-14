@@ -17,6 +17,7 @@ from app.database.models import (
 )
 from app.database.settings import RuntimeSettingsService
 from app.payments.reconciliation import schedule_reconciliation
+from app.bot.settings import send_approval_notifications
 
 PAGE_SIZE = 8
 PRODUCT_FIELDS = ("name", "slug", "price_toman", "traffic_gb", "duration_days", "service_ids", "users_limit")
@@ -362,7 +363,14 @@ def router(settings, sessions, lifecycle=None) -> Router:
         oid=int(c.data.rsplit(":",1)[1])
         async with sessions() as s,s.begin():
             result=await s.execute(update(Order).where(Order.id==oid,Order.status==OrderStatus.WAITING_RECEIPT).values(status=OrderStatus.PAID,paid_at=datetime.now(UTC))); changed=result.rowcount==1
-        if changed and lifecycle: schedule_reconciliation(lifecycle)
+            order=await s.get(Order,oid); reseller=await s.get(Reseller,order.reseller_id)
+            dry_run=await runtime.is_dry_run(s)
+        if changed:
+            await send_approval_notifications(
+                c.bot, customer_id=reseller.telegram_id, owner_ids=settings.owner_ids,
+                order_number=order.order_number, dry_run=dry_run,
+            )
+            if not dry_run and lifecycle: schedule_reconciliation(lifecycle)
         await c.answer("تأیید شد" if changed else "قبلاً پردازش شده",show_alert=True)
     @r.callback_query(F.data.startswith("order:reject:"))
     async def order_reject(c):

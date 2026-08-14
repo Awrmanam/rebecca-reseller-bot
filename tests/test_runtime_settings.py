@@ -18,3 +18,4 @@ async def test_database_grace_override_changes_effective_value():
         session.add(Setting(key="user_delete_grace_hours", value=24))
     async with sessions() as session:
         assert await service.grace_hours(session) == 24
+    await engine.dispose()

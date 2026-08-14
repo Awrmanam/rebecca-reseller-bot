@@ -118,3 +118,4 @@ async def test_renewal_never_resets_or_sends_password():
     updates = [mutation for mutation in fake.mutations if mutation[0] == "update"]
     assert len(updates) == 1
     assert "password" not in updates[0][2]
+    await factory.kw["bind"].dispose()
