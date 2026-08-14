@@ -17,6 +17,9 @@ class RuntimeSettingsService:
         "user_delete_grace_hours",
         "time_warning_thresholds",
         "traffic_warning_thresholds",
+        "customer_panel_url",
+        "trial_traffic_gb",
+        "trial_duration_hours",
     }
 
     def __init__(self, defaults: Settings):
@@ -52,6 +55,18 @@ class RuntimeSettingsService:
         value = int(await self._value(session, "user_delete_grace_hours"))
         if not 1 <= value <= 24 * 30:
             raise ValueError("user_delete_grace_hours must be between 1 and 720")
+        return value
+
+    async def trial_traffic_gb(self, session: AsyncSession) -> int:
+        value = int(await self._value(session, "trial_traffic_gb"))
+        if value <= 0:
+            raise ValueError("trial_traffic_gb must be positive")
+        return value
+
+    async def trial_duration_hours(self, session: AsyncSession) -> int:
+        value = int(await self._value(session, "trial_duration_hours"))
+        if value <= 0:
+            raise ValueError("trial_duration_hours must be positive")
         return value
 
     async def time_thresholds(self, session: AsyncSession) -> tuple[int, ...]:

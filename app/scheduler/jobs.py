@@ -9,11 +9,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.audit.service import audit
 from app.config import Settings
 from app.database.locks import locked
-from app.database.models import Order, OrderStatus, Product, Reseller, ResellerStatus, ResellerUserCache
+from app.database.models import Order, OrderStatus, Product, Reseller, ResellerStatus, ResellerUserCache, Setting
 from app.notifications.service import NotificationService
 from app.rebecca.client import RebeccaClient
 from app.reseller.quota import exhausted
-from app.reseller.service import credentials, provision
+from app.reseller.service import generate_password, provision, username_candidate
+from app.bot.credentials import credential_message
 from app.users.lifecycle import DeletePolicy, deletion_time, safe_delete
 from app.users.ownership import verified_owner
 from app.payments.service import apply_order
@@ -266,7 +267,7 @@ class LifecycleRunner:
                     continue
                 try:
                     if not reseller.rebecca_admin_username:
-                        username, _ = credentials()
+                        username = await self._available_username(session, reseller.telegram_username)
                         reseller.rebecca_admin_username = username
                         reseller.status = ResellerStatus.PROVISIONING
                         order.status = OrderStatus.APPLYING
@@ -285,7 +286,13 @@ class LifecycleRunner:
                     if reseller.status == ResellerStatus.PROVISIONING:
                         target = order.after_snapshot["target"]
                         username = reseller.rebecca_admin_username
-                        _, password = credentials()
+                        password = generate_password(
+                            forbidden=(
+                                self.settings.rebecca_bearer_token,
+                                self.settings.bot_token,
+                                self.settings.plisio_secret_key,
+                            )
+                        )
                         await provision(
                             self.rebecca,
                             username=username,
@@ -301,7 +308,25 @@ class LifecycleRunner:
                         # The password is never persisted or logged. A failed
                         # delivery leaves PROVISIONING and retries by resetting
                         # this same admin's password.
-                        delivered = await self.notifications.send(reseller.telegram_id, f"✅ نمایندگی شما ساخته شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nرمز فقط همین بار نمایش داده می‌شود.")
+                        panel_url = await session.scalar(
+                            select(Setting.value).where(Setting.key == "customer_panel_url")
+                        )
+                        text = credential_message(
+                            product_name=product.name,
+                            traffic_gb=product.traffic_gb,
+                            duration_days=product.duration_days,
+                            expiry=target["expire"],
+                            users_limit=product.users_limit,
+                            username=username,
+                            password=password,
+                            panel_url=panel_url,
+                        )
+                        sender = getattr(self.notifications, "send_credentials", None)
+                        delivered = (
+                            await sender(reseller.telegram_id, text, username, password, panel_url)
+                            if sender
+                            else await self.notifications.send(reseller.telegram_id, text)
+                        )
                         if not delivered:
                             raise RuntimeError("credential delivery failed")
                         reseller.status = ResellerStatus.ACTIVE
@@ -318,7 +343,25 @@ class LifecycleRunner:
                 else:
                     if changed:
                         await audit(session, "RESELLER_RENEWED", "reseller", reseller.rebecca_admin_username or str(reseller.id), "OK", order_id=order.id, before=order.before_snapshot, after=order.after_snapshot)
-                        await self.notifications.send(reseller.telegram_id, f"✅ سفارش #{order.order_number} با موفقیت اعمال شد.")
+                        target = (order.after_snapshot or {}).get("target", {})
+                        await self.notifications.send(
+                            reseller.telegram_id,
+                            f"✅ تمدید سفارش #{order.order_number} انجام شد.\n"
+                            f"📦 پلن: {product.name}\n📊 حجم جدید: {product.traffic_gb} GB\n"
+                            f"📅 انقضای جدید: {target.get('expire', reseller.expires_at)}\n"
+                            f"👥 سقف کاربران: {product.users_limit or 'نامحدود'}",
+                        )
+
+    async def _available_username(self, session, telegram_username: str | None) -> str:
+        """Reserve candidate selection against local durable reservations."""
+        for _ in range(100):
+            candidate = username_candidate(telegram_username)
+            exists = await session.scalar(
+                select(Reseller.id).where(Reseller.rebecca_admin_username == candidate)
+            )
+            if exists is None and await self.rebecca.get_admin(candidate) is None:
+                return candidate
+        raise RuntimeError("unable to reserve a unique reseller username")
 
     async def _reconcile_plisio(self, session) -> None:
         if not self.settings.plisio_enabled or not self.settings.plisio_secret_key:

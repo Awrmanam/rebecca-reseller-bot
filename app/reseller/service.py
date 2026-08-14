@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import re
 from datetime import datetime
 from typing import Any
 
@@ -33,8 +34,36 @@ RESTRICTED_PERMISSIONS = {
 }
 
 
-def credentials() -> tuple[str, str]:
-    return f"r{secrets.token_hex(6)}", secrets.token_urlsafe(20)
+def generate_password(*, forbidden: tuple[str, ...] = ()) -> str:
+    """Return a fresh password which cannot contain any supplied secret.
+
+    ``forbidden`` is defense in depth for callers which have environment
+    credentials in scope.  Password material is generated independently by
+    ``secrets`` and is never accepted from configuration.
+    """
+    blocked = tuple(value for value in forbidden if value)
+    while True:
+        password = secrets.token_urlsafe(24)
+        if password not in blocked and not any(value in password for value in blocked):
+            return password
+
+
+def username_candidate(telegram_username: str | None, suffix: int | None = None) -> str:
+    """Build a Rebecca-safe username without using customer-controlled syntax."""
+    raw = (telegram_username or "").strip().lstrip("@").lower()
+    base = re.sub(r"[^a-z0-9_]+", "_", raw)
+    base = re.sub(r"_+", "_", base).strip("_")[:48]
+    if not base:
+        base = "reseller"
+    number = suffix if suffix is not None else secrets.randbelow(9000) + 1000
+    return f"{base}_{number:04d}"
+
+
+def credentials(
+    telegram_username: str | None = None, *, forbidden: tuple[str, ...] = ()
+) -> tuple[str, str]:
+    """Compatibility helper returning independently generated credentials."""
+    return username_candidate(telegram_username), generate_password(forbidden=forbidden)
 
 
 def _same_second(left: datetime | None, right: datetime | None) -> bool:
