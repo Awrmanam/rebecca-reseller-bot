@@ -478,7 +478,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             row=await session.get(Setting,"trial_enabled"); current=True if row is None else bool(row.value)
             if row: row.value=not current
             else: session.add(Setting(key="trial_enabled",value=False))
-        await call.answer("ذخیره شد",show_alert=True)
+        await settings_trial(call)
 
     @r.callback_query(F.data.startswith("settings:edit:"))
     async def settings_edit(call: CallbackQuery, state: FSMContext):
