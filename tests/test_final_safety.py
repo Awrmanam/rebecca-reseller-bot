@@ -31,6 +31,7 @@ async def test_dry_run_trial_records_decision_without_consuming_or_mutating():
     assert trial is None
     assert event and event.target_identifier == "123"
     assert fake.mutations == []
+    await engine.dispose()
 
 
 def test_status_normalization_equivalents_and_unknown():

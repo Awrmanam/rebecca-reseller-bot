@@ -15,17 +15,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.keyboards.main import customer_menu, owner_menu
 from app.bot.middlewares.membership import is_member
-from app.bot.settings import (approval_messages, mask_card_number, normalize_card_number,
+from app.bot.settings import (mask_card_number, normalize_card_number,
                               normalize_support_username, parse_service_ids)
+from app.bot.settings import send_approval_notifications
 from app.config import Settings
 from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
                                  RequiredChannel, Reseller, Setting, TrialRecord)
 from app.database.settings import RuntimeSettingsService
 from app.payments.service import approve_card
+from app.payments.reconciliation import schedule_reconciliation
 from app.payments.plisio import PlisioClient
 from app.rebecca.client import RebeccaClient
 from app.rebecca.exceptions import VerificationError
-from app.reseller.service import credentials, provision
+from app.reseller.service import generate_password, provision, username_candidate
+from app.bot.credentials import credential_keyboard
 from app.reseller.trial import failure_status, record_dry_run_request, reserve_trial
 
 
@@ -64,7 +67,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                     session.add(Reseller(telegram_id=message.from_user.id, telegram_username=message.from_user.username))
                 else:
                     existing.telegram_username = message.from_user.username
-        await message.answer("به ربات مدیریت نمایندگی Rebecca خوش آمدید.", reply_markup=owner_menu(settings.dry_run) if owner else customer_menu())
+        if owner:
+            async with sessions() as session:
+                mode = await runtime.operations_mode(session)
+        await message.answer("به ربات مدیریت نمایندگی Rebecca خوش آمدید.", reply_markup=owner_menu(mode) if owner else customer_menu())
 
     @r.message(F.text == "👤 حساب من")
     async def account(message: Message):
@@ -186,11 +192,12 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             reseller = await session.get(Reseller, order.reseller_id)
             dry_run = await runtime.is_dry_run(session)
         if changed:
-            customer_text, owner_text = approval_messages(order.order_number, dry_run)
-            await bot.send_message(reseller.telegram_id, customer_text)
-            if owner_text:
-                for owner in settings.owner_ids:
-                    await bot.send_message(owner, owner_text)
+            await send_approval_notifications(
+                bot, customer_id=reseller.telegram_id, owner_ids=settings.owner_ids,
+                order_number=order.order_number, dry_run=dry_run,
+            )
+            if not dry_run and lifecycle is not None:
+                schedule_reconciliation(lifecycle)
         await call.answer("تأیید شد" if changed else "قبلاً پردازش شده", show_alert=True)
 
     @r.callback_query(F.data.startswith("cardno:"))
@@ -238,15 +245,27 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 return
             record=await session.scalar(select(TrialRecord).where(TrialRecord.telegram_id == user_id))
             if record is None:
-                username, _ = credentials()
-                record=await reserve_trial(session,user_id,username,settings.trial_duration_hours)
+                username = None
+                telegram_username = message.from_user.username if message.from_user else None
+                for _ in range(100):
+                    candidate = username_candidate(telegram_username)
+                    local_trial = await session.scalar(select(TrialRecord.id).where(TrialRecord.admin_username == candidate))
+                    local_reseller = await session.scalar(select(Reseller.id).where(Reseller.rebecca_admin_username == candidate))
+                    if local_trial is None and local_reseller is None and await rebecca.get_admin(candidate) is None:
+                        username = candidate
+                        break
+                if username is None: raise RuntimeError("unable to reserve unique trial username")
+                record=await reserve_trial(session,user_id,username,await runtime.trial_duration_hours(session))
                 await session.commit()  # durable reservation before Rebecca mutation
             elif record.status not in {"PROVISIONING", "PROVISIONED_PENDING_DELIVERY"}:
                 await message.answer("شما قبلاً از تست رایگان استفاده کرده‌اید."); return
             service_ids=await session.scalar(select(Setting.value).where(Setting.key=="trial_service_ids")) or []
-            username=record.admin_username; _,password=credentials(); expire=record.expires_at
+            trial_traffic_gb = await runtime.trial_traffic_gb(session)
+            username=record.admin_username
+            password=generate_password(forbidden=(settings.rebecca_bearer_token,settings.bot_token,settings.plisio_secret_key))
+            expire=record.expires_at
             try:
-                await provision(rebecca,username=username,password=password,expire=expire,data_limit=settings.trial_traffic_gb*1024**3,services=service_ids,telegram_id=user_id)
+                await provision(rebecca,username=username,password=password,expire=expire,data_limit=trial_traffic_gb*1024**3,services=service_ids,telegram_id=user_id)
                 reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == user_id))
                 if reseller:
                     reseller.rebecca_admin_username = username
@@ -254,7 +273,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                     reseller.trial = True
                     reseller.trial_used = True
                     reseller.expires_at = expire
-                    reseller.purchased_traffic_bytes = settings.trial_traffic_gb * 1024**3
+                    reseller.purchased_traffic_bytes = trial_traffic_gb * 1024**3
                 record.status="PROVISIONED_PENDING_DELIVERY"; await session.commit()
             except VerificationError as exc:
                 record.status=failure_status(exc); await session.commit()
@@ -268,7 +287,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 await message.answer("ارتباط با Rebecca موقتاً ناموفق بود؛ دوباره تلاش کنید.")
                 return
         try:
-            await message.answer(f"🎁 تست شما فعال شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",parse_mode="Markdown")
+            await message.answer(
+                f"🎁 تست شما فعال شد.\nنام کاربری: <code>{username}</code>\nرمز عبور: <code>{password}</code>\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",
+                parse_mode="HTML", reply_markup=credential_keyboard(username,password,None),
+            )
         except Exception:
             return
         async with sessions() as session, session.begin():
@@ -319,6 +341,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         )
         keyboard = _inline([
             [("💳 اطلاعات کارت", "settings:card"), ("☎️ پشتیبانی", "settings:support")],
+            [("🔗 لینک پنل مشتری", "settings:panel"), ("🛡 وضعیت امنیت", "settings:security")],
             [("🎁 تست رایگان", "settings:trial"), ("🧪 حالت اجرا", "settings:mode")],
             [("⬅️ بازگشت", "settings:close")],
         ])
@@ -357,17 +380,29 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         async with sessions() as session: value=await session.scalar(select(Setting.value).where(Setting.key=="support_username"))
         await call.message.answer(f"☎️ پشتیبانی: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:support_username'),('⬅️ بازگشت','settings:root')]])); await call.answer()
 
+    @r.callback_query(F.data == "settings:panel")
+    async def settings_panel(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        async with sessions() as session: value=await session.scalar(select(Setting.value).where(Setting.key=="customer_panel_url"))
+        await call.message.answer(f"🔗 لینک پنل مشتری: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:customer_panel_url'),('⬅️ بازگشت','settings:root')]])); await call.answer()
+
+    @r.callback_query(F.data == "settings:security")
+    async def settings_security(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        await call.message.answer("🛡 کلیدهای عملیات مخرب فقط از محیط اجرا خوانده می‌شوند و از تلگرام قابل تغییر نیستند.", reply_markup=_inline([[('⬅️ بازگشت','settings:root')]])); await call.answer()
+
     @r.callback_query(F.data == "settings:trial")
     async def settings_trial(call: CallbackQuery):
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
         async with sessions() as session:
             enabled=await session.scalar(select(Setting.value).where(Setting.key=="trial_enabled")); ids=await session.scalar(select(Setting.value).where(Setting.key=="trial_service_ids")) or []
+            traffic=await runtime.trial_traffic_gb(session); duration=await runtime.trial_duration_hours(session)
         services_text=""
         if rebecca and getattr(rebecca, "capabilities", None) and rebecca.capabilities.services_list:
             try:
                 advertised=await rebecca.list_services(); services_text="\nسرویس‌های Rebecca:\n"+"\n".join(f"{x.get('id')}: {x.get('name','-')}" for x in advertised[:30])
             except Exception: services_text="\nخواندن سرویس‌های Rebecca ناموفق بود."
-        await call.message.answer(f"🎁 تست رایگان: {'روشن' if enabled is not False else 'خاموش'}\nشناسه‌ها: {ids}{services_text}",reply_markup=_inline([[('روشن/خاموش','settings:trial_toggle'),('ویرایش سرویس‌ها','settings:edit:trial_service_ids')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await call.message.answer(f"🎁 تست رایگان: {'روشن' if enabled is not False else 'خاموش'}\nشناسه‌ها: {ids}\nحجم: {traffic} GB\nمدت: {duration} ساعت{services_text}",reply_markup=_inline([[('روشن/خاموش','settings:trial_toggle'),('ویرایش سرویس‌ها','settings:edit:trial_service_ids')],[('ویرایش حجم','settings:edit:trial_traffic_gb'),('ویرایش مدت','settings:edit:trial_duration_hours')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:trial_toggle")
     async def settings_trial_toggle(call: CallbackQuery):
@@ -381,7 +416,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
     @r.callback_query(F.data.startswith("settings:edit:"))
     async def settings_edit(call: CallbackQuery, state: FSMContext):
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز",show_alert=True); return
-        key=call.data.split(":",2)[2]; allowed={"card_number","card_holder","card_bank","card_instructions","support_username","trial_service_ids"}
+        key=call.data.split(":",2)[2]; allowed={"card_number","card_holder","card_bank","card_instructions","support_username","trial_service_ids","trial_traffic_gb","trial_duration_hours","customer_panel_url"}
         if key not in allowed: await call.answer("غیرمجاز",show_alert=True); return
         await state.set_state(OwnerSettingState.value); await state.update_data(setting_key=key)
         await call.message.answer("مقدار جدید را ارسال کنید.",reply_markup=_inline([[('لغو / بازگشت','settings:cancel')]])); await call.answer()
@@ -399,6 +434,12 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             if key=="card_number": value=normalize_card_number(message.text)
             elif key=="support_username": value=normalize_support_username(message.text)
             elif key=="trial_service_ids": value=parse_service_ids(message.text)
+            elif key in {"trial_traffic_gb","trial_duration_hours"}:
+                value=int(message.text)
+                if value <= 0: raise ValueError("مقدار باید مثبت باشد.")
+            elif key=="customer_panel_url":
+                value=message.text.strip()
+                if not value.startswith(("https://", "http://")): raise ValueError("لینک باید با https:// یا http:// شروع شود.")
             else:
                 value=message.text.strip()
                 if not value: raise ValueError("مقدار خالی مجاز نیست.")
@@ -427,6 +468,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         if call.from_user.id not in settings.owner_ids: return
         mode="live" if call.data.endswith("live_confirm") else "dry_run"
         async with sessions() as session, session.begin(): await runtime.set_operations_mode(session,mode)
+        await call.message.answer("صفحه‌کلید به‌روزرسانی شد.", reply_markup=owner_menu(mode))
         await call.answer("حالت عملیات تغییر کرد",show_alert=True)
 
     @r.message(F.text == "💳 پرداخت‌ها")

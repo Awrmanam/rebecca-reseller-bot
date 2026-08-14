@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import WarningEvent
+from app.bot.credentials import credential_keyboard
 
 log = logging.getLogger(__name__)
 
@@ -17,11 +18,11 @@ class NotificationService:
         self.bot = bot
         self.owner_ids = tuple(owner_ids)
 
-    async def send(self, chat_id: int, text: str) -> bool:
+    async def send(self, chat_id: int, text: str, **kwargs) -> bool:
         if self.bot is None:
             return False
         try:
-            await self.bot.send_message(chat_id, text)
+            await self.bot.send_message(chat_id, text, **kwargs)
             return True
         except Exception as exc:
             log.warning("telegram notification failed: %s", type(exc).__name__)
@@ -30,6 +31,16 @@ class NotificationService:
     async def owners(self, text: str) -> None:
         for owner_id in self.owner_ids:
             await self.send(owner_id, text)
+
+    async def send_credentials(
+        self, chat_id: int, text: str, username: str, password: str, panel_url: str | None
+    ) -> bool:
+        return await self.send(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=credential_keyboard(username, password, panel_url),
+        )
 
     async def once(
         self,

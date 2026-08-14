@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.database.models import Order, OrderStatus, Payment
 from .plisio import exact_amount, verify
 
-def router(factory: async_sessionmaker, secret: str, source_currency: str = "USD") -> APIRouter:
+def router(factory: async_sessionmaker, secret: str, source_currency: str = "USD", reconciliation=None) -> APIRouter:
     r=APIRouter()
     @r.post("/payments/plisio/callback")
     async def callback(request: Request):
@@ -27,5 +27,8 @@ def router(factory: async_sessionmaker, secret: str, source_currency: str = "USD
             if order.status != OrderStatus.WAITING_PAYMENT: raise HTTPException(409,"invalid order state")
             order.status=OrderStatus.PAID; order.paid_at=__import__('datetime').datetime.now(__import__('datetime').timezone.utc)
             if payment: payment.plisio_txn_id=payload.get("txn_id"); payment.status="completed"
+        if reconciliation is not None:
+            trigger = getattr(reconciliation, "trigger", reconciliation)
+            trigger()
         return {"ok":True,"paid":True}
     return r

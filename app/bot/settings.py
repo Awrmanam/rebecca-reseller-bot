@@ -49,3 +49,14 @@ def approval_messages(order_number: str, dry_run: bool) -> tuple[str, str | None
         f"✅ پرداخت سفارش #{order_number} تأیید شد و ساخت/تمدید در صف پردازش قرار گرفت.",
         None,
     )
+
+
+async def send_approval_notifications(
+    bot, *, customer_id: int, owner_ids: tuple[int, ...], order_number: str, dry_run: bool
+) -> None:
+    """Send the single canonical post-approval customer/owner notification."""
+    customer_text, owner_text = approval_messages(order_number, dry_run)
+    await bot.send_message(customer_id, customer_text)
+    if owner_text:
+        for owner_id in owner_ids:
+            await bot.send_message(owner_id, owner_text)

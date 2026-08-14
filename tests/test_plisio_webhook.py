@@ -32,3 +32,4 @@ async def test_completed_callback_is_idempotent_after_paid():
     assert first.status_code == 200 and first.json() == {"ok": True, "paid": True}
     assert second.status_code == 200
     assert second.json() == {"ok": True, "paid": True, "idempotent": True}
+    await engine.dispose()
