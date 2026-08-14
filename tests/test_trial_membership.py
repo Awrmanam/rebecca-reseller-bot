@@ -4,6 +4,8 @@ from sqlalchemy.ext.asyncio import create_async_engine,async_sessionmaker
 from app.bot.middlewares.membership import is_member
 from app.database.models import Base
 from app.reseller.trial import reserve_trial
+from app.reseller.trial import failure_status
+from app.rebecca.exceptions import RebeccaUnavailable
 class Bot:
  def __init__(self,status): self.status=status
  async def get_chat_member(self,c,u): return SimpleNamespace(status=self.status)
@@ -19,3 +21,7 @@ async def test_trial_only_once_database_enforced():
  async with sf() as s:
   record = await reserve_trial(s,123,"reserved-name"); assert record.admin_username == "reserved-name"; await s.commit()
  async with sf() as s: assert await reserve_trial(s,123,"different-name") is None
+
+
+def test_transport_failure_keeps_trial_recoverable():
+ assert failure_status(RebeccaUnavailable("temporary")) == "PROVISIONING"

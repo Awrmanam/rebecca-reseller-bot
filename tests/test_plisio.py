@@ -25,6 +25,12 @@ def test_node_semantics_do_not_recursively_sort_nested_objects():
     assert signature(first, "secret") != signature(second, "secret")
 
 
+def test_node_semantics_preserve_top_level_callback_order():
+    first = {"txn_id": "1", "status": "completed", "order_number": "O1"}
+    reordered = {"order_number": "O1", "status": "completed", "txn_id": "1"}
+    assert signature(first, "secret") != signature(reordered, "secret")
+
+
 def test_transaction_details_nested_params_shape():
     operation = normalize_operation(
         json.loads((FIXTURES / "plisio_operation.json").read_text())

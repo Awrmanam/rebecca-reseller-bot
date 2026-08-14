@@ -4,6 +4,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import TrialRecord
+from app.rebecca.exceptions import VerificationError
 
 
 async def reserve_trial(
@@ -25,3 +26,8 @@ async def reserve_trial(
         await session.rollback()
         return None
     return record
+
+
+def failure_status(error: Exception) -> str:
+    """Only unsafe/invalid live state consumes a trial terminally."""
+    return "FAILED" if isinstance(error, VerificationError) else "PROVISIONING"

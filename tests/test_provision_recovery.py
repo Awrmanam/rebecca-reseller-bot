@@ -4,7 +4,7 @@ import pytest
 
 from app.rebecca.models import Admin
 from app.reseller.service import provision
-from app.rebecca.exceptions import VerificationError
+from app.rebecca.exceptions import RebeccaUnavailable, VerificationError
 from tests.fakes import FakeRebecca
 
 
@@ -59,3 +59,37 @@ async def test_post_create_verification_includes_status_and_users_limit():
             services=[3],
             users_limit=5,
         )
+
+
+@pytest.mark.asyncio
+async def test_transient_trial_retry_uses_same_reserved_username():
+    expire = datetime.fromtimestamp(1_800_000_000, UTC)
+
+    class TransientFake(FakeRebecca):
+        def __init__(self):
+            super().__init__()
+            self.unavailable = True
+
+        async def get_admin(self, username):
+            if self.unavailable:
+                self.unavailable = False
+                raise RebeccaUnavailable("temporary")
+            return self.admins.get(username)
+
+        async def create_reseller_admin(self, payload):
+            self.mutations.append(("create", payload))
+            self.admins[payload["username"]] = Admin(
+                username=payload["username"], role="reseller", status="active",
+                expire=payload["expire"], data_limit=payload["data_limit"],
+                services=payload["services"], users_limit=payload["users_limit"],
+            )
+            return self.admins[payload["username"]]
+
+    fake = TransientFake()
+    reserved = "trial-reserved-once"
+    with pytest.raises(RebeccaUnavailable):
+        await provision(fake, username=reserved, password="first", expire=expire, data_limit=10, services=[1])
+    result = await provision(fake, username=reserved, password="second", expire=expire, data_limit=10, services=[1])
+    assert result.username == reserved
+    creates = [item for item in fake.mutations if item[0] == "create"]
+    assert len(creates) == 1 and creates[0][1]["username"] == reserved

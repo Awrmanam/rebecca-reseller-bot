@@ -10,12 +10,10 @@ import httpx
 
 
 def callback_message(payload: dict[str, Any]) -> str:
-    """Official non-PHP/Node JSON semantics: sort top-level keys only."""
-    unsigned = {
-        key: payload[key]
-        for key in sorted(payload)
-        if key != "verify_hash"
-    }
+    """Official Node JSON semantics: preserve parsed insertion order."""
+    # dict preserves the JSON parser's insertion order, matching object spread
+    # followed by delete in the official Node callback example.
+    unsigned = {key: value for key, value in payload.items() if key != "verify_hash"}
     return json.dumps(
         unsigned,
         ensure_ascii=False,

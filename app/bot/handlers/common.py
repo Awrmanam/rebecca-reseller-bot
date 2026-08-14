@@ -20,8 +20,9 @@ from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
 from app.payments.service import approve_card
 from app.payments.plisio import PlisioClient
 from app.rebecca.client import RebeccaClient
+from app.rebecca.exceptions import VerificationError
 from app.reseller.service import credentials, provision
-from app.reseller.trial import reserve_trial
+from app.reseller.trial import failure_status, reserve_trial
 
 
 class ReceiptState(StatesGroup):
@@ -233,10 +234,17 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                     reseller.expires_at = expire
                     reseller.purchased_traffic_bytes = settings.trial_traffic_gb * 1024**3
                 record.status="PROVISIONED_PENDING_DELIVERY"; await session.commit()
-            except Exception:
-                record.status="FAILED"; await session.commit()
+            except VerificationError as exc:
+                record.status=failure_status(exc); await session.commit()
                 for owner in settings.owner_ids: await bot.send_message(owner,f"🚨 ساخت تست برای {user_id} ناموفق/ناامن بود.")
                 await message.answer("ساخت تست تأیید نشد؛ اطلاعات ورود ارسال نشد."); return
+            except Exception as exc:
+                # Transport/server/capability failures remain retryable with
+                # this exact reserved username.
+                record.status = failure_status(exc)
+                await session.commit()
+                await message.answer("ارتباط با Rebecca موقتاً ناموفق بود؛ دوباره تلاش کنید.")
+                return
         try:
             await message.answer(f"🎁 تست شما فعال شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",parse_mode="Markdown")
         except Exception:
