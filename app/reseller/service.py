@@ -9,6 +9,14 @@ async def provision(client: RebeccaClient, *, username: str, password: str, expi
     payload={"username":username,"password":password,"role":"reseller","permissions":RESTRICTED_PERMISSIONS,"expire":expire,"data_limit":data_limit,"services":services,"telegram_id":telegram_id,"require_2fa":False}
     await client.create_reseller_admin(payload)
     live=await client.get_admin(username)
-    if live is None or live.username != username or live.role != "reseller" or live.role in {"sudo","full_access"}: raise VerificationError("unsafe or unverifiable reseller role")
+    if live is None or live.username != username or live.role != "reseller" or live.role in {"sudo","full_access"}:
+        # A privilege escalation is worse than a failed trial. Disable when the
+        # server explicitly advertised that safe containment operation.
+        if live is not None and live.role in {"sudo", "full_access"}:
+            try:
+                await client.disable_admin(username)
+            except Exception:
+                pass
+        raise VerificationError("unsafe or unverifiable reseller role")
     if live.data_limit != data_limit or set(live.services) != set(services): raise VerificationError("limits/services verification failed")
     return live

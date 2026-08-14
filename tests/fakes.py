@@ -11,7 +11,7 @@ class FakeRebecca(RebeccaClient):
   self.mutations.append(("update",u,p)); a=self.admins[u]; a.data_limit=p.get("data_limit",a.data_limit)
   if "expire" in p:
    from datetime import datetime
-   a.expire=datetime.fromisoformat(p["expire"])
+   a.expire=p["expire"] if isinstance(p["expire"], datetime) else datetime.fromisoformat(p["expire"])
   return a
  async def disable_admin(self,u): self.mutations.append(("disable_admin",u))
  async def enable_admin(self,u): self.mutations.append(("enable_admin",u))

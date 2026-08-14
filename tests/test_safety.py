@@ -60,3 +60,19 @@ async def test_paid_survives_update_failure():
  a=Admin(username="r",role="reseller",expire=NOW,data_limit=100,used_traffic=20); f=FakeRebecca({"r":a}); f.fail_update=True; o=SimpleNamespace(id=9,status=OrderStatus.PAID,before_snapshot=None,after_snapshot=None,applied_at=None,apply_error=None); r=SimpleNamespace(status=ResellerStatus.ACTIVE,rebecca_admin_username="r"); p=SimpleNamespace(traffic_gb=1,duration_days=2)
  with pytest.raises(RuntimeError): await apply_order(o,r,p,f,NOW)
  assert o.status==OrderStatus.PAID
+
+@pytest.mark.asyncio
+async def test_target_is_persisted_before_rebecca_mutation():
+ events=[]
+ class OrderedFake(FakeRebecca):
+  async def update_admin(self,u,p):
+   events.append("mutation")
+   return await super().update_admin(u,p)
+ a=Admin(username="r",role="reseller",expire=NOW+timedelta(days=1),data_limit=100,used_traffic=20)
+ f=OrderedFake({"r":a}); o=SimpleNamespace(id=15,status=OrderStatus.PAID,before_snapshot=None,after_snapshot=None,applied_at=None,apply_error=None)
+ r=SimpleNamespace(status=ResellerStatus.ACTIVE,rebecca_admin_username="r"); p=SimpleNamespace(traffic_gb=1,duration_days=2)
+ async def persist():
+  assert o.status==OrderStatus.APPLYING and o.after_snapshot["target"]
+  events.append("persist")
+ await apply_order(o,r,p,f,NOW,persist)
+ assert events[:2]==["persist","mutation"]

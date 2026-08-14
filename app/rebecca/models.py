@@ -1,6 +1,31 @@
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from typing import Any
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, Field, field_validator
+
+
+def parse_expire(value: Any) -> datetime | None:
+    """Normalize Rebecca's Unix timestamp (or an already parsed ISO value)."""
+    if value in (None, 0, "", "0"):
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)) or str(value).isdigit():
+        return datetime.fromtimestamp(int(value), UTC)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def serialize_expire(value: datetime | int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    aware = value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    return int(aware.timestamp())
+
 
 class Admin(BaseModel):
     username: str
@@ -10,7 +35,22 @@ class Admin(BaseModel):
     data_limit: int = 0
     used_traffic: int = 0
     services: list[int | str] = Field(default_factory=list)
+    users_limit: int | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("expire", mode="before")
+    @classmethod
+    def normalize_expire(cls, value: Any) -> datetime | None:
+        return parse_expire(value)
+
+    @classmethod
+    def from_rebecca(cls, payload: dict[str, Any]) -> Admin:
+        data = dict(payload)
+        # Modern Rebecca reports aggregate reseller consumption as users_usage.
+        data["used_traffic"] = int(data.get("users_usage") or data.get("used_traffic") or 0)
+        data["raw"] = payload
+        return cls.model_validate(data)
+
 
 class User(BaseModel):
     username: str
@@ -21,3 +61,15 @@ class User(BaseModel):
     data_limit: int = 0
     used_traffic: int = 0
     raw: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("expire", mode="before")
+    @classmethod
+    def normalize_expire(cls, value: Any) -> datetime | None:
+        return parse_expire(value)
+
+    @classmethod
+    def from_rebecca(cls, payload: dict[str, Any]) -> User:
+        data = dict(payload)
+        data["used_traffic"] = int(data.get("used_traffic") or data.get("usage") or 0)
+        data["raw"] = payload
+        return cls.model_validate(data)

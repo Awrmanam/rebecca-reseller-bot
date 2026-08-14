@@ -109,4 +109,27 @@ CI همین سه check را با Python 3.12 اجرا می‌کند. testها mo
 
 ## محدودیت‌های فعلی
 
-منوی فارسی پایه و هسته‌های ایمنی/پرداخت/مدل‌ها آماده‌اند، اما wizard کامل CRUD تلگرامی، ارسال receipt به مالک، scheduler کامل batchهای sync/warning/reconciliation، API ساخت invoice Plisio، اعلان‌های واقعی و endpointهای Rebecca که نسخه نصب‌شده advertise نکرده باید پس از مشاهده schema همان نصب تکمیل/فعال شوند. این محدودیت‌ها عمداً با fail-closed کنترل شده‌اند؛ پروژه به Rebecca واقعی متصل یا deploy نشده است.
+workflowهای اصلی مشتری، رسید، محصول، تست، اعلان، lifecycle و reconciliation پیاده‌سازی شده‌اند. مدیریت پیشرفته به‌جای داشبورد شلوغ با دستورات مالک انجام می‌شود و فهرست‌ها فعلاً ۲۰ مورد اخیر را نشان می‌دهند. endpointهای Rebecca که OpenAPI نصب‌شده advertise نکند عمداً خاموش می‌مانند. پروژه به Rebecca واقعی متصل یا deploy نشده است.
+
+## دستورات مدیریتی تلگرام
+
+علاوه بر منو، مالک می‌تواند عملیات دقیق را با این دستورات انجام دهد:
+
+```text
+/product_add slug|name|price|traffic_gb|days|service_ids|users_limit
+/product_edit id name|price_toman|traffic_gb|duration_days|service_ids|users_limit|enabled value
+/product_delete id
+/channel_add chat_id join_url title
+/setting key value
+/reseller_find telegram_id|telegram_username|rebecca_username
+/reseller_hold id
+/reseller_disable id
+/reseller_enable id
+/user_delete rebecca_admin_username username
+```
+
+`/product_delete` همیشه soft-delete است. حذف کاربر پس از فرمان نیز نیازمند دکمه تأیید دوم، بازخوانی زنده، تطبیق مالکیت و روشن بودن هر دو کلید حذف است. تنظیم secretهای Plisio/Rebecca/Bot از تلگرام مجاز نیست.
+
+## اجرای زمان‌بندی‌شده
+
+job دوره‌ای با lock پایدار SQLite و batch محدود، نمایندگان و کاربران متعلق به آنان را از Rebecca همگام می‌کند، هشدارهای زمان/حجم را deduplicate می‌کند، پایان اعتبار والد و کاربران را تشخیص می‌دهد، مهلت حذف و هشدار ۲۴ ساعت را ثبت می‌کند، حذف‌های سررسیدشده را با کنترل‌های نهایی اجرا می‌کند و سفارش‌های PAID/APPLYING و Plisio را reconcile می‌کند. هدف دقیق سفارش پیش از mutation خارجی commit می‌شود تا recovery پس از crash سهمیه را دوباره اضافه نکند.
