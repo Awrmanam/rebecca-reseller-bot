@@ -308,9 +308,9 @@ class LifecycleRunner:
                         # The password is never persisted or logged. A failed
                         # delivery leaves PROVISIONING and retries by resetting
                         # this same admin's password.
-                        panel_url = await session.scalar(
-                            select(Setting.value).where(Setting.key == "customer_panel_url")
-                        )
+                        # Load immediately before delivery. Runtime settings can
+                        # change while the worker is running and require no restart.
+                        panel_url = await self.runtime.customer_panel_url(session)
                         text = credential_message(
                             product_name=product.name,
                             traffic_gb=product.traffic_gb,

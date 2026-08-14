@@ -69,6 +69,20 @@ class RuntimeSettingsService:
             raise ValueError("trial_duration_hours must be positive")
         return value
 
+    async def customer_panel_url(self, session: AsyncSession) -> str | None:
+        """Read the latest persisted panel URL; this deliberately has no cache."""
+        value = await session.scalar(
+            select(Setting.value).where(Setting.key == "customer_panel_url")
+        )
+        if value is None:
+            value = getattr(self.defaults, "customer_panel_url", None)
+        if value is None or not str(value).strip():
+            return None
+        value = str(value).strip()
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("customer_panel_url must use http:// or https://")
+        return value
+
     async def time_thresholds(self, session: AsyncSession) -> tuple[int, ...]:
         return self._thresholds(await self._value(session, "time_warning_thresholds"))
 

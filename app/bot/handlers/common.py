@@ -29,6 +29,10 @@ from app.rebecca.client import RebeccaClient
 from app.rebecca.exceptions import VerificationError
 from app.reseller.service import generate_password, provision, username_candidate
 from app.bot.credentials import credential_keyboard
+from app.bot.ui.money import format_rial, rial_digits
+from app.bot.ui.navigation import edit_or_answer, safe_edit
+from app.bot.ui.status import status_text
+from app.bot.ui.render import card_payment_keyboard
 from app.reseller.trial import failure_status, record_dry_run_request, reserve_trial
 
 
@@ -101,7 +105,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         if not items:
             await message.answer("در حال حاضر محصول فعالی وجود ندارد.")
             return
-        await message.answer("محصول را انتخاب کنید:", reply_markup=_inline([[(f"{p.name} — {p.price_toman:,.0f} تومان", f"buy:{p.id}")] for p in items]))
+        await message.answer("محصول را انتخاب کنید:", reply_markup=_inline([[(f"{p.name} — {format_rial(p.price_toman)}", f"buy:{p.id}")] for p in items]))
 
     @r.message(F.text == "🛒 خرید / تمدید")
     async def products(message: Message, bot: Bot):
@@ -112,10 +116,18 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         await show_products(call.message, bot, call.from_user.id)
         await call.answer()
 
-    @r.callback_query(F.data.startswith("buy:"))
+    @r.callback_query(F.data.regexp(r"^buy:\d+$"))
     async def choose_product(call: CallbackQuery):
         product_id = int(call.data.split(":")[1])
-        await call.message.answer("روش پرداخت:", reply_markup=_inline([[("💳 کارت به کارت", f"paycard:{product_id}"), ("₿ پرداخت رمز ارز", f"paycrypto:{product_id}")]]))
+        async with sessions() as session: product = await session.get(Product, product_id)
+        if not product: await call.answer("محصول یافت نشد", show_alert=True); return
+        text = (f"📦 {product.name}\n\n📊 حجم: {product.traffic_gb:,} GB\n"
+                f"📅 مدت: {product.duration_days} روز\n👥 سقف کاربران: {product.users_limit or 'نامحدود'}\n"
+                f"💰 قیمت: {format_rial(product.price_toman)}\n\nروش پرداخت را انتخاب کنید:")
+        rows = [[("💳 کارت به کارت", f"paycard:{product_id}")]]
+        if settings.plisio_enabled: rows.append([("₿ رمز ارز", f"paycrypto:{product_id}")])
+        rows.append([("⬅️ بازگشت", "buy:list")])
+        await safe_edit(call.message, text, reply_markup=_inline(rows))
         await call.answer()
 
     @r.callback_query(F.data.startswith("paycard:"))
@@ -132,7 +144,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             session.add(Payment(order_id=order.id, method="CARD", status="AWAITING_RECEIPT"))
             settings_rows = dict((await session.execute(select(Setting.key, Setting.value).where(Setting.key.in_(["card_number","card_holder","card_bank","card_instructions"])))).all())
         await state.set_state(ReceiptState.receipt); await state.update_data(order_id=order.id)
-        await call.message.answer(f"سفارش #{number}\nمبلغ: {product.price_toman:,.0f} تومان\nکارت: {settings_rows.get('card_number','تنظیم نشده')}\nبه نام: {settings_rows.get('card_holder','-')}\n{settings_rows.get('card_instructions','لطفاً تصویر یا فایل رسید را ارسال کنید.')}" )
+        await safe_edit(call.message, f"💳 پرداخت کارت به کارت\n\n💰 مبلغ:\n{format_rial(product.price_toman)}\n\n💳 شماره کارت:\n{settings_rows.get('card_number','تنظیم نشده')}\n\n👤 صاحب حساب:\n{settings_rows.get('card_holder','-')}\n\n{settings_rows.get('card_instructions','لطفاً تصویر یا فایل رسید را ارسال کنید.')}", reply_markup=card_payment_keyboard(product.price_toman, settings_rows.get('card_number'), product_id))
         await call.answer()
 
     @r.callback_query(F.data.startswith("paycrypto:"))
@@ -174,7 +186,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             if order.status != OrderStatus.PENDING: await message.answer("این سفارش دیگر رسید نمی‌پذیرد."); return
             order.status = OrderStatus.WAITING_RECEIPT; payment.telegram_file_id = file_id; payment.status = "WAITING_OWNER_APPROVAL"
             reseller = await session.get(Reseller, order.reseller_id); product = await session.get(Product, order.product_id)
-        caption=f"💳 پرداخت جدید\nسفارش: #{order.order_number}\nTelegram ID: {reseller.telegram_id}\nمحصول: {product.name}\nمبلغ: {order.amount:,.0f} تومان"
+        caption=f"💳 پرداخت جدید\nسفارش: #{order.order_number}\nTelegram ID: {reseller.telegram_id}\nمحصول: {product.name}\nمبلغ: {format_rial(order.amount)}"
         keyboard=_inline([[("✅ تأیید", f"cardok:{order.id}"), ("❌ رد", f"cardno:{order.id}")]])
         for owner in settings.owner_ids:
             if message.photo: await bot.send_photo(owner, file_id, caption=caption, reply_markup=keyboard)
@@ -224,7 +236,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         async with sessions() as session:
             reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==message.from_user.id))
             orders=[] if not reseller else (await session.scalars(select(Order).where(Order.reseller_id==reseller.id).order_by(desc(Order.id)).limit(10))).all()
-        await message.answer("\n".join(f"#{o.order_number} — {o.status} — {o.amount:,.0f}" for o in orders) or "پرداختی ثبت نشده است.")
+        await message.answer("\n".join(f"#{o.order_number} — {status_text(o.status)} — {format_rial(o.amount) if o.currency == 'IRT' else o.amount}" for o in orders) or "پرداختی ثبت نشده است.")
 
     async def run_trial(message: Message, bot: Bot, user_id: int):
         if rebecca is None: await message.answer("پنل Rebecca تنظیم نشده است."); return
@@ -345,7 +357,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             [("🎁 تست رایگان", "settings:trial"), ("🧪 حالت اجرا", "settings:mode")],
             [("⬅️ بازگشت", "settings:close")],
         ])
-        await target.answer(text, reply_markup=keyboard)
+        await edit_or_answer(target, text, reply_markup=keyboard)
 
     @r.message(F.text == "⚙️ تنظیمات")
     @r.message(F.text.startswith("🧪 حالت آزمایشی:"))
@@ -372,24 +384,24 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         async with sessions() as session:
             values = dict((await session.execute(select(Setting.key, Setting.value).where(Setting.key.in_(["card_number","card_holder","card_bank","card_instructions"])))).all())
         text = f"💳 اطلاعات کارت\nشماره: {mask_card_number(values.get('card_number'))}\nدارنده: {values.get('card_holder','-')}\nبانک: {values.get('card_bank','-')}\nراهنما: {values.get('card_instructions','-')}"
-        await call.message.answer(text, reply_markup=_inline([[('شماره کارت','settings:edit:card_number'),('نام دارنده','settings:edit:card_holder')],[('بانک','settings:edit:card_bank'),('راهنما','settings:edit:card_instructions')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await safe_edit(call.message, text, reply_markup=_inline([[('شماره کارت','settings:edit:card_number'),('نام دارنده','settings:edit:card_holder')],[('بانک','settings:edit:card_bank'),('راهنما','settings:edit:card_instructions')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:support")
     async def settings_support(call: CallbackQuery):
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
         async with sessions() as session: value=await session.scalar(select(Setting.value).where(Setting.key=="support_username"))
-        await call.message.answer(f"☎️ پشتیبانی: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:support_username'),('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await safe_edit(call.message, f"☎️ پشتیبانی: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:support_username'),('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:panel")
     async def settings_panel(call: CallbackQuery):
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
         async with sessions() as session: value=await session.scalar(select(Setting.value).where(Setting.key=="customer_panel_url"))
-        await call.message.answer(f"🔗 لینک پنل مشتری: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:customer_panel_url'),('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await safe_edit(call.message, f"🔗 لینک پنل مشتری: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:customer_panel_url'),('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:security")
     async def settings_security(call: CallbackQuery):
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
-        await call.message.answer("🛡 کلیدهای عملیات مخرب فقط از محیط اجرا خوانده می‌شوند و از تلگرام قابل تغییر نیستند.", reply_markup=_inline([[('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await safe_edit(call.message, "🛡 کلیدهای عملیات مخرب فقط از محیط اجرا خوانده می‌شوند و از تلگرام قابل تغییر نیستند.", reply_markup=_inline([[('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:trial")
     async def settings_trial(call: CallbackQuery):
@@ -402,7 +414,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             try:
                 advertised=await rebecca.list_services(); services_text="\nسرویس‌های Rebecca:\n"+"\n".join(f"{x.get('id')}: {x.get('name','-')}" for x in advertised[:30])
             except Exception: services_text="\nخواندن سرویس‌های Rebecca ناموفق بود."
-        await call.message.answer(f"🎁 تست رایگان: {'روشن' if enabled is not False else 'خاموش'}\nشناسه‌ها: {ids}\nحجم: {traffic} GB\nمدت: {duration} ساعت{services_text}",reply_markup=_inline([[('روشن/خاموش','settings:trial_toggle'),('ویرایش سرویس‌ها','settings:edit:trial_service_ids')],[('ویرایش حجم','settings:edit:trial_traffic_gb'),('ویرایش مدت','settings:edit:trial_duration_hours')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
+        await safe_edit(call.message, f"🎁 تست رایگان: {'روشن' if enabled is not False else 'خاموش'}\nشناسه‌ها: {ids}\nحجم: {traffic} GB\nمدت: {duration} ساعت{services_text}",reply_markup=_inline([[('روشن/خاموش','settings:trial_toggle'),('ویرایش سرویس‌ها','settings:edit:trial_service_ids')],[('ویرایش حجم','settings:edit:trial_traffic_gb'),('ویرایش مدت','settings:edit:trial_duration_hours')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:trial_toggle")
     async def settings_trial_toggle(call: CallbackQuery):
@@ -456,12 +468,12 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         async with sessions() as session: mode=await runtime.operations_mode(session)
         if mode=="live": keyboard=_inline([[('🧪 بازگشت فوری به آزمایشی','settings:mode_dry'),('⬅️ بازگشت','settings:root')]])
         else: keyboard=_inline([[('🔴 درخواست حالت زنده','settings:mode_live_warn'),('⬅️ بازگشت','settings:root')]])
-        await call.message.answer(f"حالت فعلی: {mode}",reply_markup=keyboard); await call.answer()
+        await safe_edit(call.message, f"حالت فعلی: {mode}",reply_markup=keyboard); await call.answer()
 
     @r.callback_query(F.data == "settings:mode_live_warn")
     async def mode_live_warn(call: CallbackQuery):
         if call.from_user.id not in settings.owner_ids: return
-        await call.message.answer("⚠️ در حالت زنده سفارش‌های PAID ممکن است نماینده Rebecca ایجاد یا به‌روزرسانی کنند. مطمئن هستید؟",reply_markup=_inline([[('بله، حالت زنده','settings:mode_live_confirm'),('لغو','settings:root')]])); await call.answer()
+        await safe_edit(call.message, "⚠️ در حالت زنده سفارش‌های PAID ممکن است نماینده Rebecca ایجاد یا به‌روزرسانی کنند. مطمئن هستید؟",reply_markup=_inline([[('بله، حالت زنده','settings:mode_live_confirm'),('لغو','settings:root')]])); await call.answer()
 
     @r.callback_query(F.data.in_({"settings:mode_live_confirm","settings:mode_dry"}))
     async def mode_change(call: CallbackQuery):
