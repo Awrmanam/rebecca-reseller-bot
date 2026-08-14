@@ -10,7 +10,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import desc, or_, select, update
+from sqlalchemy import desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.keyboards.main import customer_menu, owner_menu
@@ -20,7 +20,7 @@ from app.bot.settings import (mask_card_number, normalize_card_number,
 from app.bot.settings import send_approval_notifications
 from app.config import Settings
 from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
-                                 RequiredChannel, Reseller, Setting, TrialRecord)
+                                 RequiredChannel, Reseller, ResellerUserCache, Setting, TrialRecord)
 from app.database.settings import RuntimeSettingsService
 from app.payments.service import approve_card
 from app.payments.reconciliation import schedule_reconciliation
@@ -30,9 +30,10 @@ from app.rebecca.exceptions import VerificationError
 from app.reseller.service import generate_password, provision, username_candidate
 from app.bot.credentials import credential_keyboard
 from app.bot.ui.money import format_rial, rial_digits
-from app.bot.ui.navigation import edit_or_answer, safe_edit
+from app.bot.ui.navigation import edit_or_answer, mark_receipt_processed, safe_edit
 from app.bot.ui.status import status_text
 from app.bot.ui.render import card_payment_keyboard
+from app.bot.handlers.customer.panels import account_panel, user_detail_panel, users_panel
 from app.reseller.trial import failure_status, record_dry_run_request, reserve_trial
 
 
@@ -76,22 +77,37 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 mode = await runtime.operations_mode(session)
         await message.answer("به ربات مدیریت نمایندگی Rebecca خوش آمدید.", reply_markup=owner_menu(mode) if owner else customer_menu())
 
+    async def show_account(message: Message, telegram_id: int):
+        async with sessions() as session:
+            reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == telegram_id))
+        if not reseller:
+            await edit_or_answer(message, "هنوز نمایندگی فعالی ندارید.")
+            return
+        live = None
+        live_child_count = None
+        cached = rebecca is None
+        if rebecca and reseller.rebecca_admin_username:
+            try:
+                live = await rebecca.get_admin(reseller.rebecca_admin_username)
+                live_child_count = len(await rebecca.list_admin_users(reseller.rebecca_admin_username))
+            except Exception: cached = True
+        async with sessions() as session:
+            product = await session.get(Product, reseller.product_id) if reseller.product_id else None
+            child_count = await session.scalar(select(func.count(ResellerUserCache.id)).where(ResellerUserCache.reseller_id == reseller.id))
+        text, markup = account_panel(
+            reseller, product, live=live,
+            child_count=live_child_count if live_child_count is not None else child_count or 0,
+            cached=cached,
+        )
+        await edit_or_answer(message, text, reply_markup=markup)
+
     @r.message(F.text == "👤 حساب من")
     async def account(message: Message):
-        async with sessions() as session:
-            reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == message.from_user.id))
-        if not reseller:
-            await message.answer("هنوز نمایندگی فعالی ندارید.")
-            return
-        cached = " (اطلاعات ذخیره‌شده)" if not rebecca else ""
-        live = None
-        if rebecca and reseller.rebecca_admin_username:
-            try: live = await rebecca.get_admin(reseller.rebecca_admin_username)
-            except Exception: cached = " (اطلاعات ذخیره‌شده؛ پنل در دسترس نیست)"
-        remaining = ((live.data_limit-live.used_traffic) if live and live.data_limit else reseller.last_known_remaining) / 1024**3
-        remaining_text = "نامحدود" if live and live.data_limit_unlimited else f"{remaining:.2f} GB"
-        expire = live.expire if live else reseller.expires_at
-        await message.answer(f"👤 حساب نمایندگی{cached}\nوضعیت: {reseller.status}\n📦 حجم باقی‌مانده: {remaining_text}\n📅 پایان: {expire or 'نامحدود'}")
+        await show_account(message, message.from_user.id)
+
+    @r.callback_query(F.data == "account:refresh")
+    async def account_refresh(call: CallbackQuery):
+        await show_account(call.message, call.from_user.id); await call.answer()
 
     async def show_products(message: Message, bot: Bot, user_id: int):
         async with sessions() as session:
@@ -99,17 +115,22 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             if not joined:
                 rows = [[("📢 عضویت در کانال", c.join_url)] for c in channels] + [[("✅ عضو شدم", "membership:retry")]]
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, url=d) if d.startswith("http") else InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows])
-                await message.answer("برای استفاده از خدمات ابتدا عضو کانال شوید.", reply_markup=keyboard)
+                await edit_or_answer(message, "برای استفاده از خدمات ابتدا عضو کانال شوید.", reply_markup=keyboard)
                 return
             items = (await session.scalars(select(Product).where(Product.enabled, ~Product.deleted))).all()
         if not items:
-            await message.answer("در حال حاضر محصول فعالی وجود ندارد.")
+            await edit_or_answer(message, "در حال حاضر محصول فعالی وجود ندارد.")
             return
-        await message.answer("محصول را انتخاب کنید:", reply_markup=_inline([[(f"{p.name} — {format_rial(p.price_toman)}", f"buy:{p.id}")] for p in items]))
+        await edit_or_answer(message, "محصول را انتخاب کنید:", reply_markup=_inline([[(f"{p.name} — {format_rial(p.price_toman)}", f"buy:{p.id}")] for p in items]))
 
     @r.message(F.text == "🛒 خرید / تمدید")
     async def products(message: Message, bot: Bot):
         await show_products(message, bot, message.from_user.id)
+
+    @r.callback_query(F.data == "buy:list")
+    async def product_list_callback(call: CallbackQuery, bot: Bot):
+        await show_products(call.message, bot, call.from_user.id)
+        await call.answer()
 
     @r.callback_query(F.data == "membership:retry")
     async def membership_retry(call: CallbackQuery, bot: Bot):
@@ -175,7 +196,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 await call.answer("ساخت فاکتور ناموفق بود.", show_alert=True)
                 return
             session.add(Payment(order_id=order.id, method="PLISIO", status="new", plisio_txn_id=invoice["txn_id"], invoice_url=invoice["invoice_url"]))
-        await call.message.answer(f"فاکتور #{number}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="₿ پرداخت", url=invoice["invoice_url"])]]))
+        await safe_edit(call.message, f"فاکتور #{number}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="₿ پرداخت", url=invoice["invoice_url"])],
+            [InlineKeyboardButton(text="⬅️ بازگشت", callback_data=f"buy:{product_id}")],
+        ]))
         await call.answer()
 
     @r.message(ReceiptState.receipt, F.photo | F.document)
@@ -210,6 +234,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             )
             if not dry_run and lifecycle is not None:
                 schedule_reconciliation(lifecycle)
+            await mark_receipt_processed(call.message, "✅ تأیید شد")
         await call.answer("تأیید شد" if changed else "قبلاً پردازش شده", show_alert=True)
 
     @r.callback_query(F.data.startswith("cardno:"))
@@ -219,17 +244,35 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             order = await session.get(Order, int(call.data.split(":")[1]))
             if order.status != OrderStatus.WAITING_RECEIPT: await call.answer("قبلاً پردازش شده", show_alert=True); return
             order.status=OrderStatus.REJECTED; reseller=await session.get(Reseller,order.reseller_id)
+        await mark_receipt_processed(call.message, "❌ رد شد")
         await bot.send_message(reseller.telegram_id,f"❌ پرداخت سفارش #{order.order_number} رد شد. برای پیگیری با پشتیبانی تماس بگیرید."); await call.answer("رد شد")
 
-    @r.message(F.text == "👥 کاربران من")
-    async def my_users(message: Message):
+    async def show_my_users(message: Message, telegram_id: int, page=0):
         async with sessions() as session:
-            reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==message.from_user.id))
-        if not reseller or not rebecca: await message.answer("اطلاعات کاربران در دسترس نیست."); return
+            reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==telegram_id))
+        if not reseller or not rebecca: await edit_or_answer(message, "اطلاعات کاربران در دسترس نیست."); return
         try: users=await rebecca.list_admin_users(reseller.rebecca_admin_username)
-        except Exception: await message.answer("Rebecca در دسترس نیست؛ بعداً تلاش کنید."); return
-        text="\n".join(f"👤 {u.username} | {u.status} | {'نامحدود' if not u.data_limit else f'{(u.data_limit-u.used_traffic)/1024**3:.2f} GB'}" for u in users[:20]) or "کاربری وجود ندارد."
-        await message.answer(text)
+        except Exception: await edit_or_answer(message, "Rebecca در دسترس نیست؛ بعداً تلاش کنید."); return
+        text, markup = users_panel(users, page)
+        await edit_or_answer(message, text, reply_markup=markup)
+
+    @r.message(F.text == "👥 کاربران من")
+    async def my_users(message: Message): await show_my_users(message, message.from_user.id)
+
+    @r.callback_query(F.data.regexp(r"^account:users(?::\d+)?$"))
+    async def my_users_callback(call: CallbackQuery):
+        page = int(call.data.rsplit(":", 1)[1]) if call.data.count(":") == 2 else 0
+        await show_my_users(call.message, call.from_user.id, page); await call.answer()
+
+    @r.callback_query(F.data.regexp(r"^account:user:[^:]+:\d+$"))
+    async def my_user_detail(call: CallbackQuery):
+        _, _, user_index, page = call.data.split(":", 3)
+        async with sessions() as session: reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==call.from_user.id))
+        if not reseller or not rebecca: await call.answer("در دسترس نیست", show_alert=True); return
+        users = await rebecca.list_admin_users(reseller.rebecca_admin_username)
+        user = users[int(user_index)] if int(user_index) < len(users) else None
+        if not user: await call.answer("یافت نشد", show_alert=True); return
+        text, markup = user_detail_panel(user, int(page), int(user_index)); await safe_edit(call.message, text, reply_markup=markup); await call.answer()
 
     @r.message(F.text == "💳 پرداخت‌های من")
     async def my_payments(message: Message):
@@ -237,6 +280,14 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==message.from_user.id))
             orders=[] if not reseller else (await session.scalars(select(Order).where(Order.reseller_id==reseller.id).order_by(desc(Order.id)).limit(10))).all()
         await message.answer("\n".join(f"#{o.order_number} — {status_text(o.status)} — {format_rial(o.amount) if o.currency == 'IRT' else o.amount}" for o in orders) or "پرداختی ثبت نشده است.")
+
+    @r.callback_query(F.data == "account:payments")
+    async def my_payments_callback(call: CallbackQuery):
+        async with sessions() as session:
+            reseller=await session.scalar(select(Reseller).where(Reseller.telegram_id==call.from_user.id))
+            orders=[] if not reseller else (await session.scalars(select(Order).where(Order.reseller_id==reseller.id).order_by(desc(Order.id)).limit(10))).all()
+        text = "\n".join(f"#{o.order_number} — {status_text(o.status)} — {format_rial(o.amount) if o.currency == 'IRT' else o.amount}" for o in orders) or "پرداختی ثبت نشده است."
+        await safe_edit(call.message, text, reply_markup=_inline([[("⬅️ حساب", "account:refresh")]])); await call.answer()
 
     async def run_trial(message: Message, bot: Bot, user_id: int):
         if rebecca is None: await message.answer("پنل Rebecca تنظیم نشده است."); return
@@ -342,7 +393,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         except Exception: await message.answer("فرمت: /product_add slug|name|price|traffic_gb|days|service_ids|users_limit"); return
         await message.answer("✅ محصول ساخته شد.")
 
-    async def settings_summary(target):
+    async def settings_view():
         async with sessions() as session:
             mode = await runtime.operations_mode(session)
         text = (
@@ -357,6 +408,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             [("🎁 تست رایگان", "settings:trial"), ("🧪 حالت اجرا", "settings:mode")],
             [("⬅️ بازگشت", "settings:close")],
         ])
+        return text, keyboard
+
+    async def settings_summary(target):
+        text, keyboard = await settings_view()
         await edit_or_answer(target, text, reply_markup=keyboard)
 
     @r.message(F.text == "⚙️ تنظیمات")
@@ -430,13 +485,15 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز",show_alert=True); return
         key=call.data.split(":",2)[2]; allowed={"card_number","card_holder","card_bank","card_instructions","support_username","trial_service_ids","trial_traffic_gb","trial_duration_hours","customer_panel_url"}
         if key not in allowed: await call.answer("غیرمجاز",show_alert=True); return
-        await state.set_state(OwnerSettingState.value); await state.update_data(setting_key=key)
-        await call.message.answer("مقدار جدید را ارسال کنید.",reply_markup=_inline([[('لغو / بازگشت','settings:cancel')]])); await call.answer()
+        await state.set_state(OwnerSettingState.value); await state.update_data(
+            setting_key=key, panel_chat_id=call.message.chat.id, panel_message_id=call.message.message_id
+        )
+        await safe_edit(call.message, "مقدار جدید را ارسال کنید.",reply_markup=_inline([[('لغو / بازگشت','settings:cancel')]])); await call.answer()
 
     @r.callback_query(F.data == "settings:cancel")
     async def settings_cancel(call: CallbackQuery, state: FSMContext):
         if call.from_user.id not in settings.owner_ids: return
-        await state.clear(); await call.message.answer("لغو شد."); await call.answer()
+        await state.clear(); await settings_summary(call.message); await call.answer("لغو شد")
 
     @r.message(OwnerSettingState.value)
     async def settings_value(message: Message, state: FSMContext):
@@ -460,7 +517,12 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 if row: row.value=value
                 else: session.add(Setting(key=key,value=value))
         except ValueError as exc: await message.answer(str(exc)); return
-        await state.clear(); await message.answer("✅ ذخیره شد.")
+        text, keyboard = await settings_view()
+        await message.bot.edit_message_text(
+            chat_id=data["panel_chat_id"], message_id=data["panel_message_id"],
+            text=f"✅ ذخیره شد.\n\n{text}", reply_markup=keyboard,
+        )
+        await state.clear()
 
     @r.callback_query(F.data == "settings:mode")
     async def settings_mode(call: CallbackQuery):
@@ -487,7 +549,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
     async def owner_payments(message: Message):
         if message.from_user.id not in settings.owner_ids: return
         async with sessions() as session: rows=(await session.scalars(select(Order).where(Order.status.in_([OrderStatus.PAID,OrderStatus.APPLYING,OrderStatus.APPLIED])).order_by(desc(Order.id)).limit(20))).all()
-        text="\n".join(f"#{x.order_number} | {x.status}" for x in rows) or "سفارش پرداخت‌شده‌ای وجود ندارد."
+        text="\n".join(f"#{x.order_number} | {status_text(x.status)}" for x in rows) or "سفارش پرداخت‌شده‌ای وجود ندارد."
         await message.answer(text,reply_markup=_inline([[('▶️ پردازش سفارش‌های پرداخت‌شده','orders:reconcile')]]))
 
     @r.callback_query(F.data == "orders:reconcile")
@@ -509,8 +571,8 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
     async def owner_lists(message: Message):
         if message.from_user.id not in settings.owner_ids: return
         async with sessions() as session:
-            if message.text=="👥 نمایندگان": rows=(await session.scalars(select(Reseller).order_by(desc(Reseller.id)).limit(20))).all(); text="\n".join(f"{x.id}. {x.telegram_id} | {x.rebecca_admin_username} | {x.status}" for x in rows)
-            elif message.text=="💳 پرداخت‌ها": rows=(await session.scalars(select(Order).order_by(desc(Order.id)).limit(20))).all(); text="\n".join(f"#{x.order_number} | {x.status} | {x.amount:,.0f}" for x in rows)
+            if message.text=="👥 نمایندگان": rows=(await session.scalars(select(Reseller).order_by(desc(Reseller.id)).limit(20))).all(); text="\n".join(f"{x.id}. @{x.telegram_username or x.telegram_id} | {x.rebecca_admin_username} | {status_text(x.status)}" for x in rows)
+            elif message.text=="💳 پرداخت‌ها": rows=(await session.scalars(select(Order).order_by(desc(Order.id)).limit(20))).all(); text="\n".join(f"#{x.order_number} | {status_text(x.status)} | {format_rial(x.amount) if x.currency == 'IRT' else x.amount}" for x in rows)
             elif message.text=="📢 عضویت اجباری": rows=(await session.scalars(select(RequiredChannel))).all(); text="\n".join(f"{x.id}. {x.title} {x.chat_id} {'🟢' if x.enabled else '🔴'}" for x in rows)
             else: text=f"🧪 DRY_RUN={settings.dry_run}\nDisable={settings.allow_disable_actions}\nDelete={settings.allow_delete_actions}\nبرای ویرایش تنظیمات از جدول settings و دستورات مدیریتی استفاده کنید."
         await message.answer(text or "موردی وجود ندارد.")
@@ -591,7 +653,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             if term.isdigit(): clauses.append(Reseller.telegram_id==int(term))
             row=await session.scalar(select(Reseller).where(or_(*clauses)))
         if not row: await message.answer("نماینده یافت نشد."); return
-        await message.answer(f"ID: {row.id}\nTelegram: {row.telegram_id} @{row.telegram_username or '-'}\nRebecca: {row.rebecca_admin_username or '-'}\nStatus: {row.status}\nHold: {row.automation_hold}")
+        await message.answer(f"ID: {row.id}\nTelegram: {row.telegram_id} @{row.telegram_username or '-'}\nRebecca: {row.rebecca_admin_username or '-'}\nوضعیت: {status_text(row.status)}\nHold: {row.automation_hold}")
 
     @r.message(Command("reseller_hold"))
     async def reseller_hold(message: Message):

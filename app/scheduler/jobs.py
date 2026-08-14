@@ -330,6 +330,7 @@ class LifecycleRunner:
                         if not delivered:
                             raise RuntimeError("credential delivery failed")
                         reseller.status = ResellerStatus.ACTIVE
+                        reseller.product_id = product.id
                         order.status = OrderStatus.APPLIED
                         order.applied_at = datetime.now(UTC)
                         order.apply_error = None

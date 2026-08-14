@@ -19,8 +19,12 @@ from app.database.settings import RuntimeSettingsService
 from app.payments.reconciliation import schedule_reconciliation
 from app.bot.settings import send_approval_notifications
 from app.bot.ui.money import format_rial, rial_to_toman
-from app.bot.ui.navigation import edit_or_answer, safe_edit
+from app.bot.ui.navigation import edit_or_answer, mark_receipt_processed, safe_edit
 from app.bot.ui.status import status_text
+from app.bot.handlers.owner.panels import (
+    child_detail, child_label, order_label, payment_summary,
+    reseller_detail, reseller_label, reseller_summary,
+)
 
 PAGE_SIZE = 8
 PRODUCT_FIELDS = ("name", "slug", "price_toman", "traffic_gb", "duration_days", "service_ids", "users_limit")
@@ -30,6 +34,11 @@ ORDER_FILTERS = {
     "PAYMENT": (OrderStatus.WAITING_PAYMENT,), "PAID": (OrderStatus.PAID,),
     "APPLYING": (OrderStatus.APPLYING,), "APPLIED": (OrderStatus.APPLIED,),
     "FAILED": (OrderStatus.FAILED,), "CLOSED": (OrderStatus.REJECTED, OrderStatus.EXPIRED),
+}
+ORDER_FILTER_LABELS = {
+    "WAITING": "🟡 رسید", "PAYMENT": "🟠 پرداخت", "PAID": "🔵 پرداخت‌شده",
+    "APPLYING": "⚙️ در حال ساخت", "APPLIED": "🟢 تکمیل", "FAILED": "🔴 خطا",
+    "CLOSED": "⚫ بسته", "ALL": "همه",
 }
 DECISION_RESULTS = ("DRY_RUN", "ERROR", "SKIPPED", "BLOCKED", "RETRYABLE")
 
@@ -86,6 +95,13 @@ def router(settings, sessions, lifecycle=None) -> Router:
         if isinstance(event,CallbackQuery): await event.answer("غیرمجاز",show_alert=True)
         return False
 
+    async def fsm_panel(message, data, text, reply_markup=None):
+        return await message.bot.edit_message_text(
+            chat_id=data["panel_chat_id"], message_id=data["panel_message_id"],
+            text=text, reply_markup=reply_markup,
+        )
+
+
     async def product_page(target,page=0):
         async with sessions() as s:
             rows=(await s.scalars(select(Product).where(~Product.deleted).order_by(Product.id.desc()).offset(page*PAGE_SIZE).limit(PAGE_SIZE+1))).all()
@@ -123,7 +139,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
     @r.callback_query(F.data=="product:add")
     async def product_add(c,state:FSMContext):
         if not await authorized(c): return
-        await state.set_state(ProductCreate.value); await state.set_data({"index":0,"values":{}})
+        await state.set_state(ProductCreate.value); await state.set_data({"index":0,"values":{},"panel_chat_id":c.message.chat.id,"panel_message_id":c.message.message_id})
         await safe_edit(c.message, f"{PRODUCT_LABELS[PRODUCT_FIELDS[0]]} را بفرستید. /cancel برای لغو"); await c.answer()
 
     @r.message(ProductCreate.value)
@@ -135,18 +151,18 @@ def router(settings, sessions, lifecycle=None) -> Router:
         except (ValueError,TypeError) as exc: await m.answer(str(exc)); return
         values=data["values"]; values[field]=value; index+=1
         if index<len(PRODUCT_FIELDS):
-            await state.update_data(index=index,values=values); await m.answer(f"{PRODUCT_LABELS[PRODUCT_FIELDS[index]]} را بفرستید."); return
+            await state.update_data(index=index,values=values); await fsm_panel(m,data,f"{PRODUCT_LABELS[PRODUCT_FIELDS[index]]} را بفرستید."); return
         try:
             async with sessions() as s,s.begin(): s.add(Product(**values,service_type="CUSTOM"))
         except IntegrityError: await m.answer("slug تکراری است؛ دوباره شروع کنید."); await state.clear(); return
-        await state.clear(); await m.answer("✅ محصول ساخته شد.")
+        await fsm_panel(m,data,"✅ محصول ساخته شد.",_keyboard([[ ("⬅️ محصولات","product:page:0") ]])); await state.clear()
 
     @r.callback_query(F.data.startswith("product:edit:"))
     async def product_edit(c,state:FSMContext):
         if not await authorized(c): return
         _,_,pid,field=c.data.split(":",3)
         if field not in PRODUCT_FIELDS: await c.answer("غیرمجاز",show_alert=True); return
-        await state.set_state(ProductEdit.value); await state.set_data({"id":int(pid),"field":field})
+        await state.set_state(ProductEdit.value); await state.set_data({"id":int(pid),"field":field,"panel_chat_id":c.message.chat.id,"panel_message_id":c.message.message_id})
         await safe_edit(c.message, f"مقدار جدید {PRODUCT_LABELS[field]} را بفرستید. /cancel برای لغو"); await c.answer()
 
     @r.message(ProductEdit.value)
@@ -160,7 +176,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
             async with sessions() as s,s.begin():
                 p=await s.get(Product,data["id"]); setattr(p,data["field"],value)
         except IntegrityError: await m.answer("slug تکراری است."); return
-        await state.clear(); await m.answer("✅ ویرایش شد.")
+        await fsm_panel(m,data,"✅ ویرایش شد.",_keyboard([[ ("⬅️ محصول",f"product:view:{data['id']}") ]])); await state.clear()
 
     @r.callback_query(F.data.startswith("product:toggle:"))
     async def product_toggle(c):
@@ -200,7 +216,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
     @r.callback_query(F.data=="channel:add")
     async def channel_add(c,state:FSMContext):
         if not await authorized(c): return
-        await state.set_state(ChannelCreate.value); await state.set_data({"index":0,"values":{}}); await safe_edit(c.message, "chat_id را بفرستید. /cancel برای لغو"); await c.answer()
+        await state.set_state(ChannelCreate.value); await state.set_data({"index":0,"values":{},"panel_chat_id":c.message.chat.id,"panel_message_id":c.message.message_id}); await safe_edit(c.message, "chat_id را بفرستید. /cancel برای لغو"); await c.answer()
     @r.message(ChannelCreate.value)
     async def channel_create(m,state:FSMContext):
         if not await authorized(m): await state.clear(); return
@@ -208,17 +224,17 @@ def router(settings, sessions, lifecycle=None) -> Router:
         fields=("chat_id","title","join_url"); data=await state.get_data(); field=fields[data["index"]]; value=m.text.strip()
         if not value or (field=="join_url" and not value.startswith(("https://","http://"))): await m.answer("مقدار معتبر نیست."); return
         values=data["values"]; values[field]=value; index=data["index"]+1
-        if index<3: await state.update_data(index=index,values=values); await m.answer(f"{fields[index]} را بفرستید."); return
+        if index<3: await state.update_data(index=index,values=values); await fsm_panel(m,data,f"{fields[index]} را بفرستید."); return
         try:
             async with sessions() as s,s.begin(): s.add(RequiredChannel(**values))
         except IntegrityError: await m.answer("chat_id تکراری است."); await state.clear(); return
-        await state.clear(); await m.answer("✅ کانال افزوده شد.")
+        await fsm_panel(m,data,"✅ کانال افزوده شد.",_keyboard([[ ("⬅️ کانال‌ها","channel:refresh") ]])); await state.clear()
     @r.callback_query(F.data.startswith("channel:edit:"))
     async def channel_edit(c,state:FSMContext):
         if not await authorized(c): return
         _,_,cid,field=c.data.split(":",3)
         if field not in {"chat_id","title","join_url"}: await c.answer("غیرمجاز",show_alert=True); return
-        await state.set_state(ChannelEdit.value); await state.set_data({"id":int(cid),"field":field}); await safe_edit(c.message, "مقدار جدید را بفرستید. /cancel برای لغو"); await c.answer()
+        await state.set_state(ChannelEdit.value); await state.set_data({"id":int(cid),"field":field,"panel_chat_id":c.message.chat.id,"panel_message_id":c.message.message_id}); await safe_edit(c.message, "مقدار جدید را بفرستید. /cancel برای لغو"); await c.answer()
     @r.message(ChannelEdit.value)
     async def channel_edit_value(m,state:FSMContext):
         if not await authorized(m): await state.clear(); return
@@ -228,7 +244,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
         try:
             async with sessions() as s,s.begin(): x=await s.get(RequiredChannel,data["id"]); setattr(x,data["field"],value)
         except IntegrityError: await m.answer("chat_id تکراری است."); return
-        await state.clear(); await m.answer("✅ ویرایش شد.")
+        await fsm_panel(m,data,"✅ ویرایش شد.",_keyboard([[ ("⬅️ کانال",f"channel:view:{data['id']}") ]])); await state.clear()
     @r.callback_query(F.data.startswith("channel:toggle:"))
     async def channel_toggle(c):
         if not await authorized(c): return
@@ -249,14 +265,22 @@ def router(settings, sessions, lifecycle=None) -> Router:
             q=select(Reseller)
             if status: q=q.where(Reseller.status==status)
             rows=(await s.scalars(q.order_by(Reseller.id.desc()).offset(page*PAGE_SIZE).limit(PAGE_SIZE+1))).all()
-        buttons=[[(f"{x.telegram_id} | {x.status}",f"reseller:view:{x.id}")] for x in rows[:PAGE_SIZE]]
+            counts=dict((await s.execute(select(Reseller.status,func.count()).group_by(Reseller.status))).all())
+            total=await s.scalar(select(func.count(Reseller.id))) or 0
+            products={p.id:p for p in (await s.scalars(select(Product))).all()}
+        buttons=[[(reseller_label(x,products.get(x.product_id)),f"reseller:view:{x.id}")] for x in rows[:PAGE_SIZE]]
         nav=[]
         if page: nav.append(("⬅️",f"reseller:page:{page-1}:{status or 'ALL'}"))
         if len(rows)>PAGE_SIZE: nav.append(("➡️",f"reseller:page:{page+1}:{status or 'ALL'}"))
         if nav: buttons.append(nav)
-        for statuses in (("ACTIVE","PROVISIONING","EXPIRED"),("SUSPENDED","TRIAL","ALL")): buttons.append([(x,f"reseller:page:0:{x}") for x in statuses])
-        buttons.append([("🔎 جستجو","reseller:search"),("🔄 تازه‌سازی",f"reseller:page:{page}:{status or 'ALL'}")])
-        await edit_or_answer(target, "👥 مدیریت نمایندگان",reply_markup=_keyboard(buttons))
+        buttons.extend([
+            [("🔎 جستجو","reseller:search"),("فیلتر","reseller:page:0:ALL")],
+            [("🟢 فعال","reseller:page:0:ACTIVE"),("🔴 منقضی","reseller:page:0:EXPIRED")],
+            [("⏸ تعلیق","reseller:page:0:SUSPENDED"),("🎁 تست","reseller:page:0:TRIAL")],
+            [("🔄 بروزرسانی",f"reseller:page:{page}:{status or 'ALL'}")],
+        ])
+        await edit_or_answer(target,reseller_summary(counts,total),reply_markup=_keyboard(buttons))
+
     @r.message(F.text=="👥 نمایندگان")
     async def resellers(m):
         if await authorized(m): await reseller_page(m)
@@ -267,21 +291,35 @@ def router(settings, sessions, lifecycle=None) -> Router:
     @r.callback_query(F.data=="reseller:search")
     async def reseller_search(c,state:FSMContext):
         if not await authorized(c): return
-        await state.set_state(ResellerSearch.value); await safe_edit(c.message, "Telegram ID، @username یا نام Rebecca را بفرستید."); await c.answer()
+        await state.set_state(ResellerSearch.value); await state.set_data({"panel_chat_id":c.message.chat.id,"panel_message_id":c.message.message_id}); await safe_edit(c.message, "Telegram ID، @username یا نام Rebecca را بفرستید."); await c.answer()
     @r.message(ResellerSearch.value)
     async def reseller_search_value(m,state:FSMContext):
         if not await authorized(m): await state.clear(); return
         term=m.text.strip().lstrip("@"); clauses=[Reseller.telegram_username==term,Reseller.rebecca_admin_username==term]
         if term.isdigit(): clauses.append(Reseller.telegram_id==int(term))
         async with sessions() as s: rows=(await s.scalars(select(Reseller).where(or_(*clauses)).limit(PAGE_SIZE))).all()
-        await state.clear(); await m.answer("نتایج",reply_markup=_keyboard([[(f"{x.telegram_id} | {x.status}",f"reseller:view:{x.id}")] for x in rows] or [[("یافت نشد","reseller:page:0:ALL")]]))
+        await fsm_panel(m,await state.get_data(),"نتایج",reply_markup=_keyboard([[(f"@{x.telegram_username or x.telegram_id} | {status_text(x.status)}",f"reseller:view:{x.id}")] for x in rows] or [[("یافت نشد","reseller:page:0:ALL")]])); await state.clear()
+    async def show_reseller(message,rid):
+        async with sessions() as s:
+            x=await s.get(Reseller,rid)
+            product=await s.get(Product,x.product_id) if x and x.product_id else None
+            child_count=await s.scalar(select(func.count(ResellerUserCache.id)).where(ResellerUserCache.reseller_id==rid)) or 0
+        if not x: return False
+        buttons=[[('👥 کاربران',f'reseller:children:{rid}:0'),('💳 سفارش‌ها',f'reseller:orders:{rid}')],[('🔄 Sync',f'reseller:refresh:{rid}'),('⏸ Hold/Unhold',f'reseller:hold:{rid}')],[('⚙️ مدیریت',f'reseller:manage:{rid}')],[('⬅️ فهرست','reseller:page:0:ALL')]]
+        await safe_edit(message,reseller_detail(x,product,child_count),reply_markup=_keyboard(buttons)); return True
+
     @r.callback_query(F.data.startswith("reseller:view:"))
     async def reseller_view(c):
         if not await authorized(c): return
-        rid=int(c.data.rsplit(":",1)[1])
-        async with sessions() as s: x=await s.get(Reseller,rid)
-        if not x: await c.answer("یافت نشد",show_alert=True); return
-        await safe_edit(c.message, f"Telegram: {x.telegram_id} @{x.telegram_username or '-'}\nRebecca: {x.rebecca_admin_username or '-'}\nوضعیت: {x.status}\nانقضا: {x.expires_at or '-'}\nحجم/مصرف: {x.last_known_data_limit/1024**3:.2f}/{x.last_known_usage/1024**3:.2f} GB\nHold: {x.automation_hold}\nآخرین sync: {x.last_sync_at or '-'}",reply_markup=_keyboard([[('🔄 Rebecca',f'reseller:refresh:{rid}'),('Hold/Unhold',f'reseller:hold:{rid}')],[('سفارش‌ها',f'reseller:orders:{rid}'),('کاربران',f'reseller:children:{rid}')],[('تعلیق امن',f'reseller:disable_warn:{rid}'),('فعال‌سازی امن',f'reseller:enable_warn:{rid}')]])); await c.answer()
+        if not await show_reseller(c.message,int(c.data.rsplit(":",1)[1])): await c.answer("یافت نشد",show_alert=True); return
+        await c.answer()
+
+    @r.callback_query(F.data.startswith("reseller:manage:"))
+    async def reseller_manage(c):
+        if not await authorized(c): return
+        rid=c.data.rsplit(":",1)[1]
+        await safe_edit(c.message,"⚙️ اقدامات حساس\nاجرای هر اقدام همچنان به تمام گیت‌های ایمنی نیاز دارد.",reply_markup=_keyboard([[('تعلیق امن',f'reseller:disable_warn:{rid}'),('فعال‌سازی امن',f'reseller:enable_warn:{rid}')],[('⬅️ نماینده',f'reseller:view:{rid}')]])); await c.answer()
+
     @r.callback_query(F.data.startswith("reseller:refresh:"))
     async def reseller_refresh(c):
         if not await authorized(c): return
@@ -292,22 +330,40 @@ def router(settings, sessions, lifecycle=None) -> Router:
             live=await rebecca.get_admin(x.rebecca_admin_username)
             if live:
                 x.last_known_data_limit=live.data_limit or 0; x.last_known_usage=live.used_traffic; x.last_known_remaining=(live.data_limit or 0)-live.used_traffic; x.expires_at=live.expire; x.last_sync_at=datetime.now(UTC)
-        await c.answer("همگام شد",show_alert=True)
+        await show_reseller(c.message,rid); await c.answer("همگام شد",show_alert=True)
     @r.callback_query(F.data.startswith("reseller:hold:"))
     async def reseller_hold(c):
         if not await authorized(c): return
-        async with sessions() as s,s.begin(): x=await s.get(Reseller,int(c.data.rsplit(":",1)[1])); x.automation_hold=not x.automation_hold
-        await c.answer("ذخیره شد",show_alert=True)
+        rid=int(c.data.rsplit(":",1)[1])
+        async with sessions() as s,s.begin(): x=await s.get(Reseller,rid); x.automation_hold=not x.automation_hold
+        await show_reseller(c.message,rid); await c.answer("ذخیره شد",show_alert=True)
     @r.callback_query(F.data.startswith("reseller:orders:"))
     async def reseller_orders(c):
         if not await authorized(c): return
         rid=int(c.data.rsplit(":",1)[1]); await order_page(c.message,0,None,rid); await c.answer()
-    @r.callback_query(F.data.startswith("reseller:children:"))
+    @r.callback_query(F.data.regexp(r"^reseller:children:\d+(?::\d+)?$"))
     async def reseller_children(c):
         if not await authorized(c): return
-        rid=int(c.data.rsplit(":",1)[1])
-        async with sessions() as s: rows=(await s.scalars(select(ResellerUserCache).where(ResellerUserCache.reseller_id==rid).order_by(ResellerUserCache.id.desc()).limit(30))).all()
-        await safe_edit(c.message, "\n".join(f"{x.username} | {x.status} | {(x.data_limit-x.used_traffic)/1024**3:.2f}GB | {x.expire or '-'}" for x in rows) or "کاربری ثبت نشده است."); await c.answer()
+        parts=c.data.split(":"); rid=int(parts[2]); page=int(parts[3]) if len(parts)>3 else 0
+        async with sessions() as s:
+            rows=(await s.scalars(select(ResellerUserCache).where(ResellerUserCache.reseller_id==rid).order_by(ResellerUserCache.id.desc()).offset(page*PAGE_SIZE).limit(PAGE_SIZE+1))).all()
+        buttons=[[(child_label(x),f"reseller:child:{rid}:{x.id}:{page}")] for x in rows[:PAGE_SIZE]]
+        nav=[]
+        if page: nav.append(("⬅️",f"reseller:children:{rid}:{page-1}"))
+        if len(rows)>PAGE_SIZE: nav.append(("➡️",f"reseller:children:{rid}:{page+1}"))
+        if nav: buttons.append(nav)
+        buttons.append([("⬅️ نماینده",f"reseller:view:{rid}")])
+        await safe_edit(c.message,f"👥 کاربران نماینده — {len(rows[:PAGE_SIZE])}",reply_markup=_keyboard(buttons)); await c.answer()
+
+    @r.callback_query(F.data.regexp(r"^reseller:child:\d+:\d+:\d+$"))
+    async def reseller_child_detail(c):
+        if not await authorized(c): return
+        _,_,rid,cid,page=c.data.split(":")
+        async with sessions() as s:
+            child=await s.get(ResellerUserCache,int(cid)); reseller=await s.get(Reseller,int(rid))
+        if not child or child.reseller_id != int(rid): await c.answer("یافت نشد",show_alert=True); return
+        await safe_edit(c.message,child_detail(child,reseller),reply_markup=_keyboard([[('🔄 بروزرسانی',c.data)],[('⬅️ کاربران',f'reseller:children:{rid}:{page}')]])); await c.answer()
+
     @r.callback_query(F.data.regexp(r"reseller:(disable|enable)_warn:"))
     async def reseller_state_warn(c):
         if not await authorized(c): return
@@ -334,14 +390,17 @@ def router(settings, sessions, lifecycle=None) -> Router:
             if group: q=q.where(Order.status.in_(ORDER_FILTERS[group]))
             if reseller_id: q=q.where(Order.reseller_id==reseller_id)
             rows=(await s.scalars(q.order_by(Order.id.desc()).offset(page*PAGE_SIZE).limit(PAGE_SIZE+1))).all()
-        buttons=[[(f"#{x.order_number} | {status_text(x.status)}",f"order:view:{x.id}")] for x in rows[:PAGE_SIZE]]
-        nav=[]
-        suffix=group or "ALL"
+            resellers={x.id:x for x in (await s.scalars(select(Reseller).where(Reseller.id.in_([o.reseller_id for o in rows] or [-1])))).all()}
+            counts=dict((await s.execute(select(Order.status,func.count()).group_by(Order.status))).all())
+        buttons=[[(order_label(x,resellers.get(x.reseller_id)),f"order:view:{x.id}")] for x in rows[:PAGE_SIZE]]
+        nav=[]; suffix=group or "ALL"
         if page: nav.append(("⬅️",f"order:page:{page-1}:{suffix}"))
         if len(rows)>PAGE_SIZE: nav.append(("➡️",f"order:page:{page+1}:{suffix}"))
         if nav: buttons.append(nav)
-        for groups in (("WAITING","PAYMENT","PAID"),("APPLYING","APPLIED","FAILED"),("CLOSED","ALL")): buttons.append([(x,f"order:page:0:{x}") for x in groups])
-        buttons.append([("▶️ پردازش محدود PAID","orders:reconcile"),("🔄",f"order:page:{page}:{suffix}")]); await edit_or_answer(target, "💳 کنسول پرداخت‌ها",reply_markup=_keyboard(buttons))
+        for groups in (("WAITING","PAYMENT","PAID"),("APPLYING","APPLIED","FAILED"),("CLOSED","ALL")): buttons.append([(ORDER_FILTER_LABELS[x],f"order:page:0:{x}") for x in groups])
+        buttons.append([("▶️ پردازش پرداخت‌شده","orders:reconcile"),("🔄",f"order:page:{page}:{suffix}")])
+        await edit_or_answer(target,payment_summary(counts),reply_markup=_keyboard(buttons))
+
     @r.message(F.text=="💳 پرداخت‌ها")
     async def payments(m):
         if await authorized(m): await order_page(m)
@@ -359,7 +418,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
         if o.payment_method=="CARD" and o.status==OrderStatus.WAITING_RECEIPT: actions.append([("✅ تأیید",f"order:approve:{oid}"),("❌ رد",f"order:reject:{oid}")])
         if o.status in {OrderStatus.PAID,OrderStatus.APPLYING,OrderStatus.FAILED}: actions.append([("▶️ پردازش/تلاش مجدد",f"order:retry:{oid}")])
         actions.append([("🔄",f"order:view:{oid}"),("⬅️", "order:page:0:ALL")])
-        await safe_edit(c.message, f"#{o.order_number}\nTelegram: {reseller.telegram_id} @{reseller.telegram_username or '-'}\nمحصول: {p.name}\nمبلغ: {format_rial(o.amount) if o.currency == 'IRT' else f'{o.amount} {o.currency}'}\nروش: {o.payment_method}\nوضعیت: {o.status}\nساخت: {o.created_at}\nپرداخت: {o.paid_at or '-'}\nخطا: {redact(o.apply_error) or '-'}",reply_markup=_keyboard(actions)); await c.answer()
+        await safe_edit(c.message, f"#{o.order_number}\nTelegram: {reseller.telegram_id} @{reseller.telegram_username or '-'}\nمحصول: {p.name}\nمبلغ: {format_rial(o.amount) if o.currency == 'IRT' else f'{o.amount} {o.currency}'}\nروش: {o.payment_method}\nوضعیت: {status_text(o.status)}\nوضعیت داخلی: {o.status}\nساخت: {o.created_at}\nپرداخت: {o.paid_at or '-'}\nخطا: {redact(o.apply_error) or '-'}",reply_markup=_keyboard(actions)); await c.answer()
     @r.callback_query(F.data.startswith("order:approve:"))
     async def order_approve(c):
         if not await authorized(c): return
@@ -374,12 +433,14 @@ def router(settings, sessions, lifecycle=None) -> Router:
                 order_number=order.order_number, dry_run=dry_run,
             )
             if not dry_run and lifecycle: schedule_reconciliation(lifecycle)
+            await mark_receipt_processed(c.message, "✅ تأیید شد")
         await c.answer("تأیید شد" if changed else "قبلاً پردازش شده",show_alert=True)
     @r.callback_query(F.data.startswith("order:reject:"))
     async def order_reject(c):
         if not await authorized(c): return
         oid=int(c.data.rsplit(":",1)[1])
         async with sessions() as s,s.begin(): result=await s.execute(update(Order).where(Order.id==oid,Order.status==OrderStatus.WAITING_RECEIPT).values(status=OrderStatus.REJECTED)); changed=result.rowcount==1
+        if changed: await mark_receipt_processed(c.message, "❌ رد شد")
         await c.answer("رد شد" if changed else "قبلاً پردازش شده",show_alert=True)
     @r.callback_query(F.data.startswith("order:retry:"))
     async def order_retry(c):
@@ -426,7 +487,7 @@ def router(settings, sessions, lifecycle=None) -> Router:
             rc=dict((await s.execute(select(Reseller.status,func.count()).group_by(Reseller.status))).all()); oc=dict((await s.execute(select(Order.status,func.count()).group_by(Order.status))).all())
             async def sales(since): return await s.scalar(select(func.coalesce(func.sum(Order.amount),0)).where(Order.status==OrderStatus.APPLIED,Order.currency=="IRT",Order.paid_at>=since))
             day,week,month=await sales(today),await sales(now-timedelta(days=7)),await sales(today.replace(day=1)); children=await s.scalar(select(func.count(ResellerUserCache.id)))
-        await edit_or_answer(target, "📊 داشبورد\n"+" | ".join(f"{k}: {v}" for k,v in rc.items())+"\nسفارش‌ها: "+" | ".join(f"{k}: {v}" for k,v in oc.items())+f"\nفروش کارت (ریال): امروز {format_rial(day)} | ۷ روز {format_rial(week)} | ماه {format_rial(month)}\nکاربران شناخته‌شده: {children}",reply_markup=_keyboard([[('🔄 تازه‌سازی','report:refresh')]]))
+        await edit_or_answer(target, "📊 داشبورد\n"+" | ".join(f"{status_text(k)}: {v}" for k,v in rc.items())+"\nسفارش‌ها: "+" | ".join(f"{status_text(k)}: {v}" for k,v in oc.items())+f"\nفروش کارت (ریال): امروز {format_rial(day)} | ۷ روز {format_rial(week)} | ماه {format_rial(month)}\nکاربران شناخته‌شده: {children}",reply_markup=_keyboard([[('🔄 تازه‌سازی','report:refresh')]]))
     @r.message(F.text=="📊 گزارش")
     async def report(m):
         if await authorized(m): await show_report(m)
