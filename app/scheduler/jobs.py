@@ -233,6 +233,18 @@ class LifecycleRunner:
         # PAID/APPLYING orders remain durable and visible for the payment worker.
         # Claiming and Rebecca entitlement application are intentionally separate
         # from the lifecycle transaction to keep retries bounded.
+        async with locked(session, "orders:reconcile", ttl_seconds=300) as won:
+            if not won:
+                return
+            await self._reconcile_orders_locked(session)
+
+    async def reconcile_paid_orders(self) -> None:
+        """Run the scheduler's bounded order path from an owner action."""
+        async with self.sessions() as session:
+            await self._reconcile_orders(session)
+            await session.commit()
+
+    async def _reconcile_orders_locked(self, session) -> None:
         orders = (
             await session.scalars(
                 select(Order)
@@ -249,7 +261,7 @@ class LifecycleRunner:
                 if reseller is None or product is None:
                     await audit(session, "ORDER_APPLY_FAILED", "order", order.order_number, "ERROR", order_id=order.id, error="missing reseller/product")
                     continue
-                if self.settings.dry_run:
+                if await self.runtime.is_dry_run(session):
                     await audit(session, "WOULD_APPLY_ORDER", "order", order.order_number, "DRY_RUN", order_id=order.id)
                     continue
                 try:

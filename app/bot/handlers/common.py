@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
@@ -14,9 +15,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.bot.keyboards.main import customer_menu, owner_menu
 from app.bot.middlewares.membership import is_member
+from app.bot.settings import (approval_messages, mask_card_number, normalize_card_number,
+                              normalize_support_username, parse_service_ids)
 from app.config import Settings
 from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
                                  RequiredChannel, Reseller, Setting, TrialRecord)
+from app.database.settings import RuntimeSettingsService
 from app.payments.service import approve_card
 from app.payments.plisio import PlisioClient
 from app.rebecca.client import RebeccaClient
@@ -27,6 +31,10 @@ from app.reseller.trial import failure_status, record_dry_run_request, reserve_t
 
 class ReceiptState(StatesGroup):
     receipt = State()
+
+
+class OwnerSettingState(StatesGroup):
+    value = State()
 
 
 def _inline(rows):
@@ -42,8 +50,9 @@ async def _joined(bot: Bot, telegram_id: int, session) -> tuple[bool, list[Requi
     return await is_member(bot, telegram_id, [item.chat_id for item in channels]), channels
 
 
-def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaClient | None) -> Router:
+def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaClient | None, lifecycle: Any = None) -> Router:
     r = Router()
+    runtime = RuntimeSettingsService(settings)
 
     @r.message(CommandStart())
     async def start(message: Message):
@@ -175,7 +184,13 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             changed = claimed.rowcount == 1
             order = await session.get(Order, order_id)
             reseller = await session.get(Reseller, order.reseller_id)
-        if changed: await bot.send_message(reseller.telegram_id, f"✅ پرداخت سفارش #{order.order_number} تأیید شد و برای اعمال در صف قرار گرفت.")
+            dry_run = await runtime.is_dry_run(session)
+        if changed:
+            customer_text, owner_text = approval_messages(order.order_number, dry_run)
+            await bot.send_message(reseller.telegram_id, customer_text)
+            if owner_text:
+                for owner in settings.owner_ids:
+                    await bot.send_message(owner, owner_text)
         await call.answer("تأیید شد" if changed else "قبلاً پردازش شده", show_alert=True)
 
     @r.callback_query(F.data.startswith("cardno:"))
@@ -214,7 +229,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 buttons.append([InlineKeyboardButton(text="✅ عضو شدم", callback_data="membership:trial")])
                 await message.answer("برای استفاده از خدمات ابتدا عضو کانال شوید.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); return
             if enabled is False: await message.answer("تست رایگان غیرفعال است."); return
-            if settings.dry_run:
+            if await runtime.is_dry_run(session):
                 await record_dry_run_request(session, user_id)
                 await session.commit()
                 for owner in settings.owner_ids:
@@ -293,6 +308,142 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         except Exception: await message.answer("فرمت: /product_add slug|name|price|traffic_gb|days|service_ids|users_limit"); return
         await message.answer("✅ محصول ساخته شد.")
 
+    async def settings_summary(target):
+        async with sessions() as session:
+            mode = await runtime.operations_mode(session)
+        text = (
+            f"⚙️ تنظیمات\n\nحالت عملیات: {'🧪 آزمایشی' if mode == 'dry_run' else '🔴 زنده'}\n"
+            f"غیرفعال‌سازی خودکار: {settings.allow_disable_actions}\n"
+            f"حذف خودکار: {settings.allow_delete_actions}\n"
+            f"کلید عملیات مخرب: {settings.destructive_actions}"
+        )
+        keyboard = _inline([
+            [("💳 اطلاعات کارت", "settings:card"), ("☎️ پشتیبانی", "settings:support")],
+            [("🎁 تست رایگان", "settings:trial"), ("🧪 حالت اجرا", "settings:mode")],
+            [("⬅️ بازگشت", "settings:close")],
+        ])
+        await target.answer(text, reply_markup=keyboard)
+
+    @r.message(F.text == "⚙️ تنظیمات")
+    @r.message(F.text.startswith("🧪 حالت آزمایشی:"))
+    async def owner_settings(message: Message, state: FSMContext):
+        if message.from_user.id not in settings.owner_ids:
+            await message.answer("دسترسی غیرمجاز است.")
+            return
+        await state.clear()
+        await settings_summary(message)
+
+    @r.callback_query(F.data == "settings:root")
+    async def settings_root(call: CallbackQuery, state: FSMContext):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        await state.clear(); await settings_summary(call.message); await call.answer()
+
+    @r.callback_query(F.data == "settings:close")
+    async def settings_close(call: CallbackQuery, state: FSMContext):
+        if call.from_user.id not in settings.owner_ids: return
+        await state.clear(); await call.message.edit_text("تنظیمات بسته شد."); await call.answer()
+
+    @r.callback_query(F.data == "settings:card")
+    async def settings_card(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        async with sessions() as session:
+            values = dict((await session.execute(select(Setting.key, Setting.value).where(Setting.key.in_(["card_number","card_holder","card_bank","card_instructions"])))).all())
+        text = f"💳 اطلاعات کارت\nشماره: {mask_card_number(values.get('card_number'))}\nدارنده: {values.get('card_holder','-')}\nبانک: {values.get('card_bank','-')}\nراهنما: {values.get('card_instructions','-')}"
+        await call.message.answer(text, reply_markup=_inline([[('شماره کارت','settings:edit:card_number'),('نام دارنده','settings:edit:card_holder')],[('بانک','settings:edit:card_bank'),('راهنما','settings:edit:card_instructions')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
+
+    @r.callback_query(F.data == "settings:support")
+    async def settings_support(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        async with sessions() as session: value=await session.scalar(select(Setting.value).where(Setting.key=="support_username"))
+        await call.message.answer(f"☎️ پشتیبانی: {value or 'تنظیم نشده'}",reply_markup=_inline([[('ویرایش','settings:edit:support_username'),('⬅️ بازگشت','settings:root')]])); await call.answer()
+
+    @r.callback_query(F.data == "settings:trial")
+    async def settings_trial(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز", show_alert=True); return
+        async with sessions() as session:
+            enabled=await session.scalar(select(Setting.value).where(Setting.key=="trial_enabled")); ids=await session.scalar(select(Setting.value).where(Setting.key=="trial_service_ids")) or []
+        services_text=""
+        if rebecca and getattr(rebecca, "capabilities", None) and rebecca.capabilities.services_list:
+            try:
+                advertised=await rebecca.list_services(); services_text="\nسرویس‌های Rebecca:\n"+"\n".join(f"{x.get('id')}: {x.get('name','-')}" for x in advertised[:30])
+            except Exception: services_text="\nخواندن سرویس‌های Rebecca ناموفق بود."
+        await call.message.answer(f"🎁 تست رایگان: {'روشن' if enabled is not False else 'خاموش'}\nشناسه‌ها: {ids}{services_text}",reply_markup=_inline([[('روشن/خاموش','settings:trial_toggle'),('ویرایش سرویس‌ها','settings:edit:trial_service_ids')],[('⬅️ بازگشت','settings:root')]])); await call.answer()
+
+    @r.callback_query(F.data == "settings:trial_toggle")
+    async def settings_trial_toggle(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: return
+        async with sessions() as session, session.begin():
+            row=await session.get(Setting,"trial_enabled"); current=True if row is None else bool(row.value)
+            if row: row.value=not current
+            else: session.add(Setting(key="trial_enabled",value=False))
+        await call.answer("ذخیره شد",show_alert=True)
+
+    @r.callback_query(F.data.startswith("settings:edit:"))
+    async def settings_edit(call: CallbackQuery, state: FSMContext):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز",show_alert=True); return
+        key=call.data.split(":",2)[2]; allowed={"card_number","card_holder","card_bank","card_instructions","support_username","trial_service_ids"}
+        if key not in allowed: await call.answer("غیرمجاز",show_alert=True); return
+        await state.set_state(OwnerSettingState.value); await state.update_data(setting_key=key)
+        await call.message.answer("مقدار جدید را ارسال کنید.",reply_markup=_inline([[('لغو / بازگشت','settings:cancel')]])); await call.answer()
+
+    @r.callback_query(F.data == "settings:cancel")
+    async def settings_cancel(call: CallbackQuery, state: FSMContext):
+        if call.from_user.id not in settings.owner_ids: return
+        await state.clear(); await call.message.answer("لغو شد."); await call.answer()
+
+    @r.message(OwnerSettingState.value)
+    async def settings_value(message: Message, state: FSMContext):
+        if message.from_user.id not in settings.owner_ids: await state.clear(); return
+        data=await state.get_data(); key=data["setting_key"]
+        try:
+            if key=="card_number": value=normalize_card_number(message.text)
+            elif key=="support_username": value=normalize_support_username(message.text)
+            elif key=="trial_service_ids": value=parse_service_ids(message.text)
+            else:
+                value=message.text.strip()
+                if not value: raise ValueError("مقدار خالی مجاز نیست.")
+            async with sessions() as session, session.begin():
+                row=await session.get(Setting,key)
+                if row: row.value=value
+                else: session.add(Setting(key=key,value=value))
+        except ValueError as exc: await message.answer(str(exc)); return
+        await state.clear(); await message.answer("✅ ذخیره شد.")
+
+    @r.callback_query(F.data == "settings:mode")
+    async def settings_mode(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: return
+        async with sessions() as session: mode=await runtime.operations_mode(session)
+        if mode=="live": keyboard=_inline([[('🧪 بازگشت فوری به آزمایشی','settings:mode_dry'),('⬅️ بازگشت','settings:root')]])
+        else: keyboard=_inline([[('🔴 درخواست حالت زنده','settings:mode_live_warn'),('⬅️ بازگشت','settings:root')]])
+        await call.message.answer(f"حالت فعلی: {mode}",reply_markup=keyboard); await call.answer()
+
+    @r.callback_query(F.data == "settings:mode_live_warn")
+    async def mode_live_warn(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: return
+        await call.message.answer("⚠️ در حالت زنده سفارش‌های PAID ممکن است نماینده Rebecca ایجاد یا به‌روزرسانی کنند. مطمئن هستید؟",reply_markup=_inline([[('بله، حالت زنده','settings:mode_live_confirm'),('لغو','settings:root')]])); await call.answer()
+
+    @r.callback_query(F.data.in_({"settings:mode_live_confirm","settings:mode_dry"}))
+    async def mode_change(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: return
+        mode="live" if call.data.endswith("live_confirm") else "dry_run"
+        async with sessions() as session, session.begin(): await runtime.set_operations_mode(session,mode)
+        await call.answer("حالت عملیات تغییر کرد",show_alert=True)
+
+    @r.message(F.text == "💳 پرداخت‌ها")
+    async def owner_payments(message: Message):
+        if message.from_user.id not in settings.owner_ids: return
+        async with sessions() as session: rows=(await session.scalars(select(Order).where(Order.status.in_([OrderStatus.PAID,OrderStatus.APPLYING,OrderStatus.APPLIED])).order_by(desc(Order.id)).limit(20))).all()
+        text="\n".join(f"#{x.order_number} | {x.status}" for x in rows) or "سفارش پرداخت‌شده‌ای وجود ندارد."
+        await message.answer(text,reply_markup=_inline([[('▶️ پردازش سفارش‌های پرداخت‌شده','orders:reconcile')]]))
+
+    @r.callback_query(F.data == "orders:reconcile")
+    async def owner_reconcile(call: CallbackQuery):
+        if call.from_user.id not in settings.owner_ids: await call.answer("غیرمجاز",show_alert=True); return
+        if lifecycle is None: await call.answer("سرویس Rebecca در دسترس نیست",show_alert=True); return
+        async with sessions() as session: dry=await runtime.is_dry_run(session)
+        await lifecycle.reconcile_paid_orders()
+        await call.answer("فقط تصمیم‌ها ثبت شد (DRY_RUN)" if dry else "پردازش محدود اجرا شد",show_alert=True)
+
     @r.message(F.text == "🧾 لاگ عملیات")
     @r.message(F.text == "📋 تصمیم‌های اخیر")
     async def audits(message: Message):
@@ -300,7 +451,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         async with sessions() as session: rows=(await session.scalars(select(AuditLog).order_by(desc(AuditLog.id)).limit(20))).all()
         await message.answer("\n".join(f"{x.action} | {x.target_identifier} | {x.result}" for x in rows) or "لاگی وجود ندارد.")
 
-    @r.message(F.text.in_({"👥 نمایندگان","💳 پرداخت‌ها","📢 عضویت اجباری","🎁 تنظیم تست","⚙️ تنظیمات","📊 گزارش"}))
+    @r.message(F.text.in_({"👥 نمایندگان","📢 عضویت اجباری","🎁 تنظیم تست","📊 گزارش"}))
     async def owner_lists(message: Message):
         if message.from_user.id not in settings.owner_ids: return
         async with sessions() as session:
@@ -357,7 +508,16 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         except Exception: await message.answer("فرمت: /setting key value"); return
         allowed={"trial_enabled","trial_service_ids","card_number","card_holder","card_bank","card_instructions","support_username","plisio_toman_per_source","user_delete_grace_hours","time_warning_thresholds","traffic_warning_thresholds"}
         if key not in allowed: await message.answer("این تنظیم از تلگرام قابل تغییر نیست."); return
-        if key.endswith("_ids") or key.endswith("thresholds"): parsed=[int(x) for x in value.split(",") if x]
+        if key == "card_number":
+            try: parsed=normalize_card_number(value)
+            except ValueError as exc: await message.answer(str(exc)); return
+        elif key == "support_username":
+            try: parsed=normalize_support_username(value)
+            except ValueError as exc: await message.answer(str(exc)); return
+        elif key == "trial_service_ids":
+            try: parsed=parse_service_ids(value)
+            except ValueError as exc: await message.answer(str(exc)); return
+        elif key.endswith("_ids") or key.endswith("thresholds"): parsed=[int(x) for x in value.split(",") if x]
         elif key.endswith("enabled"): parsed=value.lower() in {"1","true","on"}
         else: parsed=value
         async with sessions() as session, session.begin():
