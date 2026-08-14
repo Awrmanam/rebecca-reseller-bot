@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from uvicorn import Config, Server
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from app.bot.handlers.common import router as bot_router
+from app.bot.handlers.settings import router as settings_router
 from app.config import get_settings
 from app.database.models import CapabilitySnapshot
 from app.database.session import init_db, make_engine, session_factory
@@ -27,7 +28,7 @@ async def run():
     server=Server(Config(web,host=settings.host,port=settings.port,log_level=settings.log_level.lower()))
     tasks=[asyncio.create_task(server.serve())]
     if settings.bot_token:
-        bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(bot_router(settings, sessions, client)); tasks.append(asyncio.create_task(dp.start_polling(bot)))
+        bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(settings_router(settings, sessions)); dp.include_router(bot_router(settings, sessions, client)); tasks.append(asyncio.create_task(dp.start_polling(bot)))
     else:
         bot = None
     if client:
