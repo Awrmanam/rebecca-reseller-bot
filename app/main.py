@@ -26,14 +26,14 @@ async def run():
         async with sessions() as session, session.begin(): session.add(CapabilitySnapshot(capabilities=caps.snapshot()))
     server=Server(Config(web,host=settings.host,port=settings.port,log_level=settings.log_level.lower()))
     tasks=[asyncio.create_task(server.serve())]
-    if settings.bot_token:
-        bot=Bot(settings.bot_token); dp=Dispatcher(); dp.include_router(bot_router(settings, sessions, client)); tasks.append(asyncio.create_task(dp.start_polling(bot)))
-    else:
-        bot = None
+    bot=Bot(settings.bot_token) if settings.bot_token else None
+    runner = None
     if client:
         runner = LifecycleRunner(sessions, client, NotificationService(bot, settings.owner_ids), settings)
         scheduler = AsyncIOScheduler(timezone=settings.timezone)
         scheduler.add_job(runner.run, "interval", seconds=settings.sync_interval_seconds, max_instances=1, coalesce=True)
         scheduler.start()
+    if bot:
+        dp=Dispatcher(); dp.include_router(bot_router(settings, sessions, client, runner)); tasks.append(asyncio.create_task(dp.start_polling(bot)))
     await asyncio.gather(*tasks)
 if __name__=="__main__": asyncio.run(run())
