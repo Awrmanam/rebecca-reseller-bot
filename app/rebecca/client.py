@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .capabilities import Capabilities, from_openapi
+from .capabilities import Capabilities, from_openapi, resolve_operation_paths
 from .exceptions import CapabilityMissing, NotFound, RebeccaError, RebeccaUnavailable
 from .models import Admin, User, serialize_expire
 
@@ -59,6 +59,7 @@ class HTTPRebeccaClient(RebeccaClient):
             timeout=15,
         )
         self.capabilities = Capabilities()
+        self.operation_paths: dict[str, str] = {}
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         try:
@@ -87,8 +88,10 @@ class HTTPRebeccaClient(RebeccaClient):
             schema = await self._request("GET", "/openapi.json")
         except (RebeccaError, RebeccaUnavailable):
             self.capabilities = Capabilities()
+            self.operation_paths = {}
         else:
             self.capabilities = from_openapi(schema)
+            self.operation_paths = resolve_operation_paths(schema)
         return self.capabilities
 
     async def get_current_admin(self) -> Admin | None:
@@ -139,9 +142,19 @@ class HTTPRebeccaClient(RebeccaClient):
     async def activate_admin_users(self, username: str) -> None:
         await self._admin_action(username, "users/activate", "admin_users_activate")
 
+    def _advertised_path(self, capability: str, **parameters: str) -> str:
+        self._require(capability)
+        template = self.operation_paths.get(capability)
+        if template is None:
+            raise CapabilityMissing(f"{capability}: advertised route unavailable")
+        return template.format(**parameters)
+
     async def get_admin_usage(self, username: str) -> dict[str, Any]:
-        self._require("admin_usage")
-        return await self._request("GET", f"/api/admin/{username}/usage")
+        path = self._advertised_path("admin_usage", username=username)
+        data = await self._request("GET", path)
+        if not isinstance(data, dict):
+            raise RebeccaError("unexpected admin usage response")
+        return data
 
     async def list_admin_users(self, username: str) -> list[User]:
         self._require("user_list_by_owner")
@@ -191,6 +204,19 @@ class HTTPRebeccaClient(RebeccaClient):
         await self._request("POST", f"/api/user/{username}/revoke_sub")
 
     async def list_services(self) -> list[dict[str, Any]]:
-        self._require("services_list")
-        data = await self._request("GET", "/api/services")
-        return data.get("services", data) if isinstance(data, dict) else data
+        path = self._advertised_path("services_list")
+        data = await self._request("GET", path)
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("services"), list):
+                rows = data["services"]
+            elif isinstance(data.get("items"), list):
+                rows = data["items"]
+            else:
+                raise RebeccaError("unexpected services response wrapper")
+        else:
+            raise RebeccaError("unexpected services response")
+        if not all(isinstance(item, dict) for item in rows):
+            raise RebeccaError("services response contains non-object entries")
+        return rows
