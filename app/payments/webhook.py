@@ -29,6 +29,6 @@ def router(factory: async_sessionmaker, secret: str, source_currency: str = "USD
             if payment: payment.plisio_txn_id=payload.get("txn_id"); payment.status="completed"
         if reconciliation is not None:
             trigger = getattr(reconciliation, "trigger", reconciliation)
-            await trigger()
+            trigger()
         return {"ok":True,"paid":True}
     return r

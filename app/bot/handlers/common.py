@@ -22,10 +22,12 @@ from app.database.models import (AuditLog, Order, OrderStatus, Payment, Product,
                                  RequiredChannel, Reseller, Setting, TrialRecord)
 from app.database.settings import RuntimeSettingsService
 from app.payments.service import approve_card
+from app.payments.reconciliation import schedule_reconciliation
 from app.payments.plisio import PlisioClient
 from app.rebecca.client import RebeccaClient
 from app.rebecca.exceptions import VerificationError
-from app.reseller.service import credentials, provision
+from app.reseller.service import generate_password, provision, username_candidate
+from app.bot.credentials import credential_keyboard
 from app.reseller.trial import failure_status, record_dry_run_request, reserve_trial
 
 
@@ -195,7 +197,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 for owner in settings.owner_ids:
                     await bot.send_message(owner, owner_text)
             if not dry_run and lifecycle is not None:
-                await lifecycle.reconcile_paid_orders()
+                schedule_reconciliation(lifecycle)
         await call.answer("تأیید شد" if changed else "قبلاً پردازش شده", show_alert=True)
 
     @r.callback_query(F.data.startswith("cardno:"))
@@ -243,14 +245,25 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 return
             record=await session.scalar(select(TrialRecord).where(TrialRecord.telegram_id == user_id))
             if record is None:
-                username, _ = credentials()
+                username = None
+                telegram_username = message.from_user.username if message.from_user else None
+                for _ in range(100):
+                    candidate = username_candidate(telegram_username)
+                    local_trial = await session.scalar(select(TrialRecord.id).where(TrialRecord.admin_username == candidate))
+                    local_reseller = await session.scalar(select(Reseller.id).where(Reseller.rebecca_admin_username == candidate))
+                    if local_trial is None and local_reseller is None and await rebecca.get_admin(candidate) is None:
+                        username = candidate
+                        break
+                if username is None: raise RuntimeError("unable to reserve unique trial username")
                 record=await reserve_trial(session,user_id,username,await runtime.trial_duration_hours(session))
                 await session.commit()  # durable reservation before Rebecca mutation
             elif record.status not in {"PROVISIONING", "PROVISIONED_PENDING_DELIVERY"}:
                 await message.answer("شما قبلاً از تست رایگان استفاده کرده‌اید."); return
             service_ids=await session.scalar(select(Setting.value).where(Setting.key=="trial_service_ids")) or []
             trial_traffic_gb = await runtime.trial_traffic_gb(session)
-            username=record.admin_username; _,password=credentials(); expire=record.expires_at
+            username=record.admin_username
+            password=generate_password(forbidden=(settings.rebecca_bearer_token,settings.bot_token,settings.plisio_secret_key))
+            expire=record.expires_at
             try:
                 await provision(rebecca,username=username,password=password,expire=expire,data_limit=trial_traffic_gb*1024**3,services=service_ids,telegram_id=user_id)
                 reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == user_id))
@@ -274,7 +287,10 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                 await message.answer("ارتباط با Rebecca موقتاً ناموفق بود؛ دوباره تلاش کنید.")
                 return
         try:
-            await message.answer(f"🎁 تست شما فعال شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",parse_mode="Markdown")
+            await message.answer(
+                f"🎁 تست شما فعال شد.\nنام کاربری: <code>{username}</code>\nرمز عبور: <code>{password}</code>\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",
+                parse_mode="HTML", reply_markup=credential_keyboard(username,password,None),
+            )
         except Exception:
             return
         async with sessions() as session, session.begin():
