@@ -13,6 +13,7 @@ class RuntimeSettingsService:
     """Validated non-secret DB overrides with environment fallbacks."""
 
     EDITABLE = {
+        "operations_mode",
         "user_delete_grace_hours",
         "time_warning_thresholds",
         "traffic_warning_thresholds",
@@ -24,6 +25,28 @@ class RuntimeSettingsService:
     async def _value(self, session: AsyncSession, key: str) -> Any:
         value = await session.scalar(select(Setting.value).where(Setting.key == key))
         return getattr(self.defaults, key) if value is None else value
+
+    async def operations_mode(self, session: AsyncSession) -> str:
+        value = await session.scalar(
+            select(Setting.value).where(Setting.key == "operations_mode")
+        )
+        if value is None:
+            return "dry_run" if self.defaults.dry_run else "live"
+        if value not in {"dry_run", "live"}:
+            raise ValueError("invalid operations_mode")
+        return value
+
+    async def is_dry_run(self, session: AsyncSession) -> bool:
+        return await self.operations_mode(session) == "dry_run"
+
+    async def set_operations_mode(self, session: AsyncSession, mode: str) -> None:
+        if mode not in {"dry_run", "live"}:
+            raise ValueError("invalid operations_mode")
+        row = await session.get(Setting, "operations_mode")
+        if row:
+            row.value = mode
+        else:
+            session.add(Setting(key="operations_mode", value=mode))
 
     async def grace_hours(self, session: AsyncSession) -> int:
         value = int(await self._value(session, "user_delete_grace_hours"))
