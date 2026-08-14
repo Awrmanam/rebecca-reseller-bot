@@ -20,12 +20,15 @@ def test_exhaustion_either_limit():
  assert exhausted(NOW-timedelta(seconds=1),100,0,NOW)
  assert exhausted(NOW+timedelta(days=1),100,100,NOW)
  assert not exhausted(NOW+timedelta(days=1),100,99,NOW)
+ assert not exhausted(None,0,999,NOW)
+ assert not exhausted(None,None,999,NOW)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("role",["sudo","full_access","standard"])
 async def test_provision_rejects_unsafe_role(role):
  a=Admin(username="res",role=role,data_limit=10,services=[1]); f=FakeRebecca({"res":a})
  with pytest.raises(VerificationError): await provision(f,username="res",password="secret",expire=NOW,data_limit=10,services=[1])
- assert f.mutations[0][1]["role"]=="reseller"
+ assert not any(item[0] == "create" for item in f.mutations)
+ if role in {"sudo", "full_access"}: assert ("disable_admin", "res") in f.mutations
 @pytest.mark.asyncio
 async def test_delete_guards_and_live_ownership():
  due=NOW-timedelta(hours=1); u=User(username="u",admin_username="other",expire=NOW-timedelta(days=1),data_limit=10,used_traffic=10); f=FakeRebecca(users={"u":u})
@@ -76,3 +79,12 @@ async def test_target_is_persisted_before_rebecca_mutation():
   events.append("persist")
  await apply_order(o,r,p,f,NOW,persist)
  assert events[:2]==["persist","mutation"]
+
+@pytest.mark.asyncio
+async def test_plan_switch_applies_services_and_users_limit():
+ a=Admin(username="r",role="reseller",expire=NOW+timedelta(days=1),data_limit=100,used_traffic=20,services=[1],users_limit=2)
+ f=FakeRebecca({"r":a}); o=SimpleNamespace(id=16,status=OrderStatus.PAID,before_snapshot=None,after_snapshot=None,applied_at=None,apply_error=None)
+ r=SimpleNamespace(status=ResellerStatus.ACTIVE,rebecca_admin_username="r")
+ p=SimpleNamespace(traffic_gb=1,duration_days=2,service_ids=[7,8],users_limit=20)
+ await apply_order(o,r,p,f,NOW)
+ assert a.services == [7,8] and a.users_limit == 20

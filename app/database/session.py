@@ -11,4 +11,17 @@ def make_engine(url: str) -> AsyncEngine:
     return engine
 def session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]: return async_sessionmaker(engine, expire_on_commit=False)
 async def init_db(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn: await conn.run_sync(Base.metadata.create_all)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        if engine.url.drivername.startswith("sqlite"):
+            columns = {
+                row[1]
+                for row in (
+                    await conn.exec_driver_sql("PRAGMA table_info(reseller_users)")
+                ).all()
+            }
+            if "disabled_by_own_expiry" not in columns:
+                await conn.exec_driver_sql(
+                    "ALTER TABLE reseller_users "
+                    "ADD COLUMN disabled_by_own_expiry BOOLEAN NOT NULL DEFAULT 0"
+                )

@@ -17,8 +17,9 @@ from app.reseller.service import credentials, provision
 from app.users.lifecycle import DeletePolicy, deletion_time, safe_delete
 from app.users.ownership import verified_owner
 from app.payments.service import apply_order
-from app.payments.plisio import PlisioClient, exact_amount
+from app.payments.plisio import PlisioClient, normalize_operation
 from app.database.models import Payment
+from app.database.settings import RuntimeSettingsService
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class LifecycleRunner:
         self.notifications = notifications
         self.settings = settings
         self.batch_size = batch_size
+        self.runtime = RuntimeSettingsService(settings)
 
     async def run(self) -> None:
         async with self.sessions() as session:
@@ -66,6 +68,8 @@ class LifecycleRunner:
             )
         ).all()
         now = datetime.now(UTC)
+        time_thresholds = await self.runtime.time_thresholds(session)
+        traffic_thresholds = await self.runtime.traffic_thresholds(session)
         for reseller in rows:
             if reseller.automation_hold or not reseller.rebecca_admin_username:
                 continue
@@ -76,21 +80,21 @@ class LifecycleRunner:
                 continue
             if live is None:
                 continue
-            reseller.last_known_data_limit = live.data_limit
+            reseller.last_known_data_limit = live.data_limit or 0
             reseller.last_known_usage = live.used_traffic
-            reseller.last_known_remaining = live.data_limit - live.used_traffic
+            reseller.last_known_remaining = (live.data_limit or 0) - live.used_traffic
             reseller.expires_at = live.expire
             reseller.last_sync_at = now
             entitlement_key = f"{live.expire}:{live.data_limit}"
             if live.expire:
                 days_left = (live.expire - now).total_seconds() / 86400
-                for threshold in self.settings.time_warning_thresholds:
+                for threshold in time_thresholds:
                     if 0 < days_left <= threshold:
                         await self.notifications.once(session, chat_id=reseller.telegram_id, target_type="reseller", target=live.username, kind=f"TIME_{threshold}", entitlement_key=entitlement_key, text=f"⚠️ کمتر از {threshold} روز از اعتبار نمایندگی شما باقی مانده است.")
                         break
-            if live.data_limit > 0:
+            if live.data_limit is not None and live.data_limit > 0:
                 percent = max(0, live.data_limit-live.used_traffic) * 100 / live.data_limit
-                for threshold in self.settings.traffic_warning_thresholds:
+                for threshold in traffic_thresholds:
                     if 0 < percent <= threshold:
                         await self.notifications.once(session, chat_id=reseller.telegram_id, target_type="reseller", target=live.username, kind=f"TRAFFIC_{threshold}", entitlement_key=entitlement_key, text=f"⚠️ کمتر از {threshold}٪ حجم نمایندگی شما باقی مانده است.")
                         break
@@ -102,6 +106,15 @@ class LifecycleRunner:
                         if child and verified_owner(child, live.username) and not exhausted(child.expire, child.data_limit, child.used_traffic, now):
                             await self.rebecca.enable_user(child.username)
                             cached.disabled_by_parent_reseller = False
+                continue
+            if reseller.status not in {
+                ResellerStatus.ACTIVE,
+                ResellerStatus.TRIAL,
+                ResellerStatus.LOW_QUOTA,
+            }:
+                # This entitlement period has already transitioned. Continue
+                # live synchronization above, but never repeat mutations or
+                # expiration notifications.
                 continue
             if self.settings.dry_run or not self.settings.allow_disable_actions:
                 await audit(session, "WOULD_DISABLE_RESELLER", "reseller", live.username, "DRY_RUN")
@@ -123,6 +136,7 @@ class LifecycleRunner:
             await session.scalars(select(Reseller).limit(self.batch_size))
         ).all()
         now = datetime.now(UTC)
+        grace_hours = await self.runtime.grace_hours(session)
         for reseller in resellers:
             if reseller.automation_hold or not reseller.rebecca_admin_username:
                 continue
@@ -154,15 +168,28 @@ class LifecycleRunner:
                 cached.last_seen_at = now
                 if exhausted(live.expire, live.data_limit, live.used_traffic, now) and cached.expired_detected_at is None:
                     cached.expired_detected_at = now
-                    cached.delete_after = deletion_time(now, self.settings.user_delete_grace_hours)
+                    cached.delete_after = deletion_time(now, grace_hours)
                     cached.local_status = "EXPIRED"
                     if not self.settings.dry_run and self.settings.allow_disable_actions:
                         await self.rebecca.disable_user(live.username)
+                        disabled = await self.rebecca.get_user(live.username)
+                        if disabled is None or disabled.status.lower() not in {"disabled", "inactive"}:
+                            await audit(session, "USER_DISABLE_VERIFY_FAILED", "user", live.username, "ERROR")
+                            continue
+                        cached.disabled_by_own_expiry = True
                     await audit(session, "USER_DELETE_SCHEDULED", "user", live.username, "OK")
-                    await self.notifications.send(reseller.telegram_id, f"⚠️ سرویس {live.username} پایان یافت و تا {self.settings.user_delete_grace_hours} ساعت آینده حذف خواهد شد.")
+                    await self.notifications.send(reseller.telegram_id, f"⚠️ سرویس {live.username} پایان یافت و تا {grace_hours} ساعت آینده حذف خواهد شد.")
                 elif not exhausted(live.expire, live.data_limit, live.used_traffic, now) and cached.delete_after:
+                    if cached.disabled_by_own_expiry and reseller.status == ResellerStatus.ACTIVE and not self.settings.dry_run:
+                        await self.rebecca.enable_user(live.username)
+                        enabled = await self.rebecca.get_user(live.username)
+                        if enabled is None or enabled.status.lower() not in {"active", "enabled"}:
+                            await audit(session, "USER_RENEW_ENABLE_VERIFY_FAILED", "user", live.username, "ERROR")
+                            continue
                     cached.expired_detected_at = None
                     cached.delete_after = None
+                    cached.warning_sent_at = None
+                    cached.disabled_by_own_expiry = False
                     cached.local_status = "ACTIVE"
                     await audit(session, "USER_DELETE_CANCELLED", "user", live.username, "RENEWED")
 
@@ -227,22 +254,49 @@ class LifecycleRunner:
                     continue
                 try:
                     if not reseller.rebecca_admin_username:
-                        username, password = credentials()
+                        username, _ = credentials()
+                        reseller.rebecca_admin_username = username
+                        reseller.status = ResellerStatus.PROVISIONING
+                        order.status = OrderStatus.APPLYING
+                        order.after_snapshot = {
+                            "target": {
+                                "username": username,
+                                "expire": (datetime.now(UTC) + timedelta(days=product.duration_days)).isoformat(),
+                                "data_limit": product.traffic_gb * 1024**3,
+                                "services": product.service_ids,
+                                "users_limit": product.users_limit,
+                            }
+                        }
+                        # Username and intended entitlement exist durably before
+                        # Rebecca sees any create request.
+                        await session.commit()
+                    if reseller.status == ResellerStatus.PROVISIONING:
+                        target = order.after_snapshot["target"]
+                        username = reseller.rebecca_admin_username
+                        _, password = credentials()
                         await provision(
                             self.rebecca,
                             username=username,
                             password=password,
-                            expire=datetime.now(UTC) + timedelta(days=product.duration_days),
-                            data_limit=product.traffic_gb * 1024**3,
-                            services=product.service_ids,
+                            expire=datetime.fromisoformat(target["expire"]),
+                            data_limit=target["data_limit"],
+                            services=target["services"],
+                            users_limit=target["users_limit"],
                             telegram_id=reseller.telegram_id,
                         )
-                        reseller.rebecca_admin_username = username
+                        order.apply_error = "CREDENTIAL_DELIVERY_PENDING"
+                        await session.commit()
+                        # The password is never persisted or logged. A failed
+                        # delivery leaves PROVISIONING and retries by resetting
+                        # this same admin's password.
+                        delivered = await self.notifications.send(reseller.telegram_id, f"✅ نمایندگی شما ساخته شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nرمز فقط همین بار نمایش داده می‌شود.")
+                        if not delivered:
+                            raise RuntimeError("credential delivery failed")
                         reseller.status = ResellerStatus.ACTIVE
-                        # The password is never persisted or logged.
-                        await self.notifications.send(reseller.telegram_id, f"✅ نمایندگی شما ساخته شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nرمز فقط همین بار نمایش داده می‌شود.")
                         order.status = OrderStatus.APPLIED
                         order.applied_at = datetime.now(UTC)
+                        order.apply_error = None
+                        order.after_snapshot = (await self.rebecca.get_admin(username)).model_dump(mode="json")
                         await audit(session, "RESELLER_CREATED", "reseller", username, "OK", order_id=order.id)
                         continue
                     changed = await apply_order(order, reseller, product, self.rebecca, datetime.now(UTC), session.commit)
@@ -273,21 +327,21 @@ class LifecycleRunner:
             if not payment.plisio_txn_id:
                 continue
             try:
-                remote = await client.transaction(payment.plisio_txn_id)
+                remote = normalize_operation(await client.transaction(payment.plisio_txn_id))
             except Exception as exc:
                 await audit(session, "PLISIO_RECONCILE_FAILED", "order", order.order_number, "ERROR", order_id=order.id, error=str(exc))
                 continue
             valid = (
-                str(remote.get("order_number")) == order.order_number
-                and str(remote.get("txn_id")) == payment.plisio_txn_id
-                and str(remote.get("source_currency", "")).upper() == order.currency.upper()
-                and exact_amount(remote.get("source_amount", "-1")) == order.amount
+                remote["order_number"] == order.order_number
+                and remote["id"] == payment.plisio_txn_id
+                and remote["source_currency"] == order.currency.upper()
+                and remote["source_amount"] == order.amount
             )
             if not valid:
                 await audit(session, "PLISIO_RECONCILE_REJECTED", "order", order.order_number, "REJECTED", order_id=order.id)
                 continue
-            payment.status = str(remote.get("status", "unknown"))
-            if remote.get("status") == "completed":
+            payment.status = remote["status"]
+            if remote["status"] == "completed":
                 order.status = OrderStatus.PAID
                 order.paid_at = datetime.now(UTC)
                 await audit(session, "PLISIO_RECONCILED", "order", order.order_number, "PAID", order_id=order.id)

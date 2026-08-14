@@ -32,7 +32,8 @@ class Admin(BaseModel):
     role: str
     status: str = "active"
     expire: datetime | None = None
-    data_limit: int = 0
+    data_limit: int | None = None
+    data_limit_unlimited: bool = False
     used_traffic: int = 0
     services: list[int | str] = Field(default_factory=list)
     users_limit: int | None = None
@@ -46,6 +47,11 @@ class Admin(BaseModel):
     @classmethod
     def from_rebecca(cls, payload: dict[str, Any]) -> Admin:
         data = dict(payload)
+        # Zero/null is potentially unlimited across Rebecca versions. Treat it
+        # explicitly as unlimited/ambiguous so lifecycle code fails closed and
+        # never authorizes an automatic deletion from that value alone.
+        raw_limit = data.get("data_limit")
+        data["data_limit_unlimited"] = raw_limit in (None, 0)
         # Modern Rebecca reports aggregate reseller consumption as users_usage.
         data["used_traffic"] = int(data.get("users_usage") or data.get("used_traffic") or 0)
         data["raw"] = payload
@@ -58,7 +64,8 @@ class User(BaseModel):
     admin_id: int | None = None
     status: str = "active"
     expire: datetime | None = None
-    data_limit: int = 0
+    data_limit: int | None = None
+    data_limit_unlimited: bool = False
     used_traffic: int = 0
     raw: dict[str, Any] = Field(default_factory=dict)
 
@@ -70,6 +77,8 @@ class User(BaseModel):
     @classmethod
     def from_rebecca(cls, payload: dict[str, Any]) -> User:
         data = dict(payload)
+        raw_limit = data.get("data_limit")
+        data["data_limit_unlimited"] = raw_limit in (None, 0)
         data["used_traffic"] = int(data.get("used_traffic") or data.get("usage") or 0)
         data["raw"] = payload
         return cls.model_validate(data)

@@ -17,5 +17,5 @@ async def test_trial_only_once_database_enforced():
  async with e.begin() as c: await c.run_sync(Base.metadata.create_all)
  sf=async_sessionmaker(e,expire_on_commit=False)
  async with sf() as s:
-  assert await reserve_trial(s,123); await s.commit()
- async with sf() as s: assert await reserve_trial(s,123) is None
+  record = await reserve_trial(s,123,"reserved-name"); assert record.admin_username == "reserved-name"; await s.commit()
+ async with sf() as s: assert await reserve_trial(s,123,"different-name") is None

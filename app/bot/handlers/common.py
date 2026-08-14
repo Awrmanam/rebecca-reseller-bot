@@ -68,14 +68,14 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         if rebecca and reseller.rebecca_admin_username:
             try: live = await rebecca.get_admin(reseller.rebecca_admin_username)
             except Exception: cached = " (اطلاعات ذخیره‌شده؛ پنل در دسترس نیست)"
-        remaining = (live.data_limit-live.used_traffic if live else reseller.last_known_remaining) / 1024**3
+        remaining = ((live.data_limit-live.used_traffic) if live and live.data_limit else reseller.last_known_remaining) / 1024**3
+        remaining_text = "نامحدود" if live and live.data_limit_unlimited else f"{remaining:.2f} GB"
         expire = live.expire if live else reseller.expires_at
-        await message.answer(f"👤 حساب نمایندگی{cached}\nوضعیت: {reseller.status}\n📦 حجم باقی‌مانده: {remaining:.2f} GB\n📅 پایان: {expire or '-'}")
+        await message.answer(f"👤 حساب نمایندگی{cached}\nوضعیت: {reseller.status}\n📦 حجم باقی‌مانده: {remaining_text}\n📅 پایان: {expire or 'نامحدود'}")
 
-    @r.message(F.text == "🛒 خرید / تمدید")
-    async def products(message: Message, bot: Bot):
+    async def show_products(message: Message, bot: Bot, user_id: int):
         async with sessions() as session:
-            joined, channels = await _joined(bot, message.from_user.id, session)
+            joined, channels = await _joined(bot, user_id, session)
             if not joined:
                 rows = [[("📢 عضویت در کانال", c.join_url)] for c in channels] + [[("✅ عضو شدم", "membership:retry")]]
                 keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, url=d) if d.startswith("http") else InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows])
@@ -86,6 +86,15 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             await message.answer("در حال حاضر محصول فعالی وجود ندارد.")
             return
         await message.answer("محصول را انتخاب کنید:", reply_markup=_inline([[(f"{p.name} — {p.price_toman:,.0f} تومان", f"buy:{p.id}")] for p in items]))
+
+    @r.message(F.text == "🛒 خرید / تمدید")
+    async def products(message: Message, bot: Bot):
+        await show_products(message, bot, message.from_user.id)
+
+    @r.callback_query(F.data == "membership:retry")
+    async def membership_retry(call: CallbackQuery, bot: Bot):
+        await show_products(call.message, bot, call.from_user.id)
+        await call.answer()
 
     @r.callback_query(F.data.startswith("buy:"))
     async def choose_product(call: CallbackQuery):
@@ -184,7 +193,7 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
         if not reseller or not rebecca: await message.answer("اطلاعات کاربران در دسترس نیست."); return
         try: users=await rebecca.list_admin_users(reseller.rebecca_admin_username)
         except Exception: await message.answer("Rebecca در دسترس نیست؛ بعداً تلاش کنید."); return
-        text="\n".join(f"👤 {u.username} | {u.status} | {(u.data_limit-u.used_traffic)/1024**3:.2f} GB" for u in users[:20]) or "کاربری وجود ندارد."
+        text="\n".join(f"👤 {u.username} | {u.status} | {'نامحدود' if not u.data_limit else f'{(u.data_limit-u.used_traffic)/1024**3:.2f} GB'}" for u in users[:20]) or "کاربری وجود ندارد."
         await message.answer(text)
 
     @r.message(F.text == "💳 پرداخت‌های من")
@@ -194,21 +203,28 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
             orders=[] if not reseller else (await session.scalars(select(Order).where(Order.reseller_id==reseller.id).order_by(desc(Order.id)).limit(10))).all()
         await message.answer("\n".join(f"#{o.order_number} — {o.status} — {o.amount:,.0f}" for o in orders) or "پرداختی ثبت نشده است.")
 
-    @r.message(F.text == "🎁 تست رایگان")
-    async def trial(message: Message, bot: Bot):
+    async def run_trial(message: Message, bot: Bot, user_id: int):
         if rebecca is None: await message.answer("پنل Rebecca تنظیم نشده است."); return
         async with sessions() as session:
-            joined, _ = await _joined(bot,message.from_user.id,session)
+            joined, channels = await _joined(bot,user_id,session)
             enabled = await session.scalar(select(Setting.value).where(Setting.key=="trial_enabled"))
-            if not joined: await message.answer("برای استفاده از خدمات ابتدا عضو کانال شوید."); return
+            if not joined:
+                buttons = [[InlineKeyboardButton(text="📢 عضویت در کانال", url=item.join_url)] for item in channels]
+                buttons.append([InlineKeyboardButton(text="✅ عضو شدم", callback_data="membership:trial")])
+                await message.answer("برای استفاده از خدمات ابتدا عضو کانال شوید.", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)); return
             if enabled is False: await message.answer("تست رایگان غیرفعال است."); return
-            record=await reserve_trial(session,message.from_user.id,settings.trial_duration_hours)
-            if record is None: await message.answer("شما قبلاً از تست رایگان استفاده کرده‌اید."); return
+            record=await session.scalar(select(TrialRecord).where(TrialRecord.telegram_id == user_id))
+            if record is None:
+                username, _ = credentials()
+                record=await reserve_trial(session,user_id,username,settings.trial_duration_hours)
+                await session.commit()  # durable reservation before Rebecca mutation
+            elif record.status not in {"PROVISIONING", "PROVISIONED_PENDING_DELIVERY"}:
+                await message.answer("شما قبلاً از تست رایگان استفاده کرده‌اید."); return
             service_ids=await session.scalar(select(Setting.value).where(Setting.key=="trial_service_ids")) or []
-            username,password=credentials(); expire=datetime.now(UTC)+timedelta(hours=settings.trial_duration_hours)
+            username=record.admin_username; _,password=credentials(); expire=record.expires_at
             try:
-                await provision(rebecca,username=username,password=password,expire=expire,data_limit=settings.trial_traffic_gb*1024**3,services=service_ids,telegram_id=message.from_user.id)
-                reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == message.from_user.id))
+                await provision(rebecca,username=username,password=password,expire=expire,data_limit=settings.trial_traffic_gb*1024**3,services=service_ids,telegram_id=user_id)
+                reseller = await session.scalar(select(Reseller).where(Reseller.telegram_id == user_id))
                 if reseller:
                     reseller.rebecca_admin_username = username
                     reseller.status = "TRIAL"
@@ -216,12 +232,30 @@ def router(settings: Settings, sessions: async_sessionmaker, rebecca: RebeccaCli
                     reseller.trial_used = True
                     reseller.expires_at = expire
                     reseller.purchased_traffic_bytes = settings.trial_traffic_gb * 1024**3
-                record.admin_username=username; record.status="ACTIVE"; await session.commit()
+                record.status="PROVISIONED_PENDING_DELIVERY"; await session.commit()
             except Exception:
                 record.status="FAILED"; await session.commit()
-                for owner in settings.owner_ids: await bot.send_message(owner,f"🚨 ساخت تست برای {message.from_user.id} ناموفق/ناامن بود.")
+                for owner in settings.owner_ids: await bot.send_message(owner,f"🚨 ساخت تست برای {user_id} ناموفق/ناامن بود.")
                 await message.answer("ساخت تست تأیید نشد؛ اطلاعات ورود ارسال نشد."); return
-        await message.answer(f"🎁 تست شما فعال شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",parse_mode="Markdown")
+        try:
+            await message.answer(f"🎁 تست شما فعال شد.\nنام کاربری: `{username}`\nرمز عبور: `{password}`\nاین اطلاعات فقط همین بار نمایش داده می‌شود.",parse_mode="Markdown")
+        except Exception:
+            return
+        async with sessions() as session, session.begin():
+            delivered = await session.scalar(select(TrialRecord).where(TrialRecord.telegram_id == user_id))
+            if delivered:
+                delivered.status = "ACTIVE"
+
+    @r.message(F.text == "🎁 تست رایگان")
+    async def trial(message: Message, bot: Bot):
+        await run_trial(message, bot, message.from_user.id)
+
+    @r.callback_query(F.data == "membership:trial")
+    async def trial_membership_retry(call: CallbackQuery, bot: Bot):
+        # Reuse the same tested flow; no trial reservation happens until all
+        # channels are confirmed.
+        await run_trial(call.message, bot, call.from_user.id)
+        await call.answer()
 
     @r.message(F.text == "☎️ پشتیبانی")
     async def support(message: Message):

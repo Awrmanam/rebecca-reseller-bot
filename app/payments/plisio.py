@@ -9,19 +9,15 @@ from typing import Any
 import httpx
 
 
-def _sort_recursive(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _sort_recursive(value[key]) for key in sorted(value)}
-    if isinstance(value, list):
-        return [_sort_recursive(item) for item in value]
-    return value
-
-
 def callback_message(payload: dict[str, Any]) -> str:
-    """Plisio JSON callback algorithm: remove hash, recursively sort, compact JSON."""
-    unsigned = {key: value for key, value in payload.items() if key != "verify_hash"}
+    """Official non-PHP/Node JSON semantics: sort top-level keys only."""
+    unsigned = {
+        key: payload[key]
+        for key in sorted(payload)
+        if key != "verify_hash"
+    }
     return json.dumps(
-        _sort_recursive(unsigned),
+        unsigned,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -45,6 +41,20 @@ def verify(payload: dict[str, Any], secret: str) -> bool:
 
 def exact_amount(value: Any) -> Decimal:
     return Decimal(str(value))
+
+
+def normalize_operation(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Plisio Transaction Details' operation + nested params shape."""
+    params = payload.get("params")
+    if not payload.get("id") or not isinstance(params, dict):
+        raise ValueError("invalid Plisio operation response")
+    return {
+        "id": str(payload["id"]),
+        "status": str(payload.get("status", "")),
+        "order_number": str(params.get("order_number", "")),
+        "source_amount": exact_amount(params.get("source_amount", "-1")),
+        "source_currency": str(params.get("source_currency", "")).upper(),
+    }
 
 
 class PlisioClient:
